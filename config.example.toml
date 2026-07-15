@@ -1,0 +1,41 @@
+# havn-channel-lark — example config. Copy to config.toml and fill in.
+# Keep this file readable only by the daemon's user: it holds the Lark
+# app secret and the havn adapter token in plaintext.
+
+# Lark/Feishu app credentials (Developer Console → Credentials & Basic Info).
+app_id     = "cli_xxxxxxxxxxxxxxxx"
+app_secret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# API host. Default is Lark International. For Feishu (China) use
+# "https://open.feishu.cn".
+lark_base_url = "https://open.larksuite.com"
+
+# havn gateway WebSocket URL (no path — the daemon appends
+# /api/v1/channel?channel=&account=).
+havn_gateway = "ws://127.0.0.1:8100"
+
+# Must match the credential the operator stored in havn under
+#   (provider = "channel:lark", name = "<account_id>").
+adapter_token = "a-long-random-string"
+
+# Matches havn's [[channels.lark.accounts]] id, and the [[bindings]] account_id.
+channel_id = "lark"
+account_id = "acme-lark-bot"
+
+# Webhook server bind address. Point Lark's "Request URL" at
+#   http(s)://<your-public-host>/webhook
+# and reverse-proxy it to this address (Lark International has no WebSocket
+# long-connection, so webhook is the only inbound path).
+webhook_listen = "0.0.0.0:8090"
+
+# Lark "Event Subscription" security (Developer Console → Events & Callbacks).
+verification_token = "the-verification-token-from-the-console"
+# Set this to the console's Encrypt Key. Strongly recommended; if you leave
+# encryption off on the console, omit this.
+encrypt_key = "the-encrypt-key-from-the-console"
+
+# Optional: voice-message transcription (OpenAI-compatible STT). Without a
+# key, inbound voice messages are dropped. Groq's free tier:
+# openai_api_key   = "gsk_..."
+# whisper_base_url = "https://api.groq.com/openai/v1"
+# whisper_model    = "whisper-large-v3-turbo"
