@@ -11,7 +11,7 @@ Lark user ──event webhook──▶ havn-channel-lark ──WS /api/v1/channe
 Lark user ◀──IM send/reply── havn-channel-lark ◀──WS outbound──────── havn gateway ◀──┘
 ```
 
-- **Inbound** arrives over an HTTP **webhook** (`im.message.receive_v1`). Lark International does not expose a WebSocket long-connection, so webhook is the only inbound path — the daemon runs an HTTP server you point Lark's "Request URL" at.
+- **Inbound** arrives over an HTTP **webhook** (`im.message.receive_v1`), the only inbound path this adapter implements: the daemon serves `POST /webhook` on `webhook_listen` (default `0.0.0.0:8090`), which you point Lark's "Request URL" at. It answers Lark's `url_verification` challenge, decrypts events when `encrypt_key` is set, and refuses events whose Verification Token does not match. The adapter opens no WebSocket long connection to Lark or Feishu: it gets only the events sent to its Request URL.
 - **Outbound** drains the gateway WS and calls Lark's IM send/reply API. A background task keeps the `tenant_access_token` fresh (Lark tokens expire every 2h).
 
 ## Setup
@@ -30,7 +30,7 @@ Lark user ◀──IM send/reply── havn-channel-lark ◀──WS outbound─
 
 ### 2. havn side
 
-In havn's `gateway.toml`:
+In havn's `config.toml` (`~/.config/havn/config.toml` of the user the gateway runs as, or `$HAVN_CONFIG`):
 
 ```toml
 [[channels.lark.accounts]]

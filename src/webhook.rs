@@ -1,7 +1,7 @@
 //! Inbound webhook HTTP server — Lark's event-subscription delivery.
 //!
-//! Lark International has no WebSocket long-connection, so events arrive
-//! as HTTP POSTs (`im.message.receive_v1`). This module:
+//! The adapter opens no long connection to Lark, so events arrive as HTTP
+//! POSTs (`im.message.receive_v1`). This module:
 //! - serves `POST /webhook`,
 //! - answers the one-time `url_verification` challenge,
 //! - AES-decrypts the body when an Encrypt Key is configured,

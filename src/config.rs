@@ -50,8 +50,8 @@ pub struct Config {
     /// Address the webhook HTTP server binds to, receiving Lark event
     /// callbacks (`im.message.receive_v1`). The operator points Lark's
     /// "Request URL" at `http(s)://<public-host>/webhook` and reverse-
-    /// proxies it to this address. Lark International has no WebSocket
-    /// long-connection, so webhook is the only inbound path.
+    /// proxies it to this address. The webhook is the only inbound path
+    /// this adapter implements; it opens no long connection to Lark.
     #[serde(default = "default_webhook_listen")]
     pub webhook_listen: String,
 
