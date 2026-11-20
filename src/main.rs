@@ -2,7 +2,7 @@
 //! `/api/v1/channel` WebSocket protocol (spec §3).
 //!
 //! Inbound (Lark → havn) arrives over a **webhook** HTTP server
-//! ([`webhook`]) — Lark International has no WebSocket long-connection.
+//! ([`webhook`]), the only inbound path this adapter implements.
 //! Outbound (havn → Lark) drains the gateway WS and calls the IM send /
 //! reply API ([`lark`]). A background task keeps the `tenant_access_token`
 //! fresh.
