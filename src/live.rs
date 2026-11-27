@@ -1,8 +1,10 @@
 //! Replies shown as they are written (havn issue #325), as
 //! havn-channel-discord shows them: the gateway's `Writing` frames of a
-//! reply go in one card, updated in place (Lark's `PATCH` of a message) as
-//! the text comes, with a **Stop** button under it; a reply longer than one
-//! card goes on in the next. The text the model writes before it uses a
+//! reply go in one card, opened with its first text (the frames that only
+//! say it is being written open none: the Typing reaction shows meanwhile)
+//! and updated in place (Lark's `PATCH` of a message) as the text comes,
+//! with a **Stop** button under it; a reply longer than one card goes on in
+//! the next. The text the model writes before it uses a
 //! tool stays as a card of its own, the reply going on below it, and the
 //! finished reply takes the place of what was shown, without the button.
 //!
@@ -13,8 +15,10 @@
 //! cannot be put in its cards goes in new ones.
 //!
 //! A card is not taken down (a bot's recall of a message can show in the
-//! chat that it recalled one): one no longer needed is updated to show
-//! nothing ([`retire`]), and only taken down when that fails.
+//! chat that it recalled one): one no longer needed (a long reply's text
+//! that came out shorter, or what was sent again below) is updated to show
+//! nothing, or a line saying where the reply is when Lark refuses a card
+//! that shows nothing ([`retire`]), and only taken down when that fails.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -178,8 +182,6 @@ struct Written {
     cards: Vec<Shown>,
     /// What the gateway last gave it to show under its last card.
     buttons: Vec<Vec<types::Button>>,
-    /// It shows only the gateway's line saying the reply is being written.
-    waiting: bool,
 }
 
 impl Written {
@@ -191,7 +193,6 @@ impl Written {
             answers,
             cards: Vec::new(),
             buttons: Vec::new(),
-            waiting: false,
         }
     }
 
@@ -236,7 +237,7 @@ impl Written {
         for change in changes(&self.cards, parts, under) {
             let n = match change {
                 Change::Delete(n) => {
-                    retire(lark, &self.cards[n].id).await;
+                    retire(lark, &self.cards[n].id, ENDS_ABOVE).await;
                     self.cards.truncate(n);
                     continue;
                 }
@@ -327,7 +328,7 @@ impl Written {
         }
         let gone: Vec<Shown> = self.cards.drain(n..).collect();
         for old in gone.iter().rev() {
-            retire(lark, &old.id).await;
+            retire(lark, &old.id, GOES_ON_BELOW).await;
         }
         self.cards.extend(sent);
     }
@@ -394,22 +395,37 @@ impl Written {
 
 /// What a card no longer needed shows: nothing, a zero-width space.
 const RETIRED: &str = "\u{200b}";
+/// What a card no longer needed after the reply's last says, when Lark
+/// refuses one that shows nothing.
+const ENDS_ABOVE: &str = "(The reply ends above.)";
+/// What one whose text was sent again below says, then.
+const GOES_ON_BELOW: &str = "(The reply goes on below.)";
 
-/// Card `id`, no longer needed, made to show nothing; taken down only when
-/// that fails, as a recall may show in the chat.
-pub async fn retire(lark: &LarkClient, id: &str) {
+/// Card `id`, no longer needed, made to show nothing, or `line` when Lark
+/// refuses a card that shows nothing; taken down only when that fails too,
+/// as a recall may show in the chat.
+async fn retire(lark: &LarkClient, id: &str, line: &str) {
     let blank = card::bare(RETIRED).to_string();
-    if lark.update_card(id, &blank, true).await.is_ok() {
-        return;
+    match lark.update_card(id, &blank, true).await {
+        Ok(()) => return,
+        Err(e) if e.downcast_ref::<Refused>().is_some() => {
+            if lark
+                .update_card(id, &card::bare(line).to_string(), true)
+                .await
+                .is_ok()
+            {
+                return;
+            }
+        }
+        Err(_) => {}
     }
     if let Err(e) = lark.delete_message(id).await {
         debug!(error = %format!("{e:#}"), "lark: a card of a reply could not be taken down");
     }
 }
 
-/// What a reply being written is to show: its text, its buttons, and
-/// whether the text is only the gateway's line saying it is being written.
-type Showing = (String, Vec<Vec<types::Button>>, bool);
+/// What a reply being written is to show: its text and its buttons.
+type Showing = (String, Vec<Vec<types::Button>>);
 
 /// A reply being written in a chat.
 #[derive(Debug)]
@@ -425,12 +441,15 @@ struct Live {
     seen: tokio::time::Instant,
 }
 
-/// The replies being written in one chat, oldest first, and those that
-/// ended lately.
+/// The replies being written in one chat, oldest first; those that have
+/// said only that they are being written, which show no card until their
+/// first text (the Typing reaction shows meanwhile); and those that ended
+/// lately.
 #[derive(Debug, Default)]
 pub struct Replies {
     live: HashMap<String, Live>,
     order: VecDeque<String>,
+    unopened: VecDeque<String>,
     ended: VecDeque<String>,
 }
 
@@ -444,6 +463,7 @@ impl Replies {
     /// comes late shows nothing. What it showed, to finish.
     fn end(&mut self, reply: String) -> Option<Live> {
         self.order.retain(|r| *r != reply);
+        self.unopened.retain(|r| *r != reply);
         let live = self.live.remove(&reply);
         stops().remove(&reply);
         self.ended.retain(|r| *r != reply);
@@ -454,15 +474,9 @@ impl Replies {
         live
     }
 
-    /// Finish `live` as it is shown: its buttons come off, its text stays;
-    /// a card saying only that the reply is being written goes.
+    /// Finish `live` as it is shown: its buttons come off, its text stays.
     async fn finish(lark: &LarkClient, live: Option<Live>) {
-        let Some(mut live) = live else {
-            return;
-        };
-        if live.written.waiting {
-            live.written.show(lark, "", false, true).await;
-        } else {
+        if let Some(mut live) = live {
             live.written.drop_buttons(lark).await;
         }
     }
@@ -501,11 +515,10 @@ impl Replies {
             if live.next > now {
                 continue;
             }
-            let Some((text, buttons, waiting)) = live.latest.take() else {
+            let Some((text, buttons)) = live.latest.take() else {
                 continue;
             };
             live.written.buttons = buttons;
-            live.written.waiting = waiting;
             let before = live.written.cards.clone();
             let shown = live_buttons(&live.written.reply, &live.written.buttons);
             let put = live
@@ -516,7 +529,7 @@ impl Replies {
             // Refused otherwise: tried again once the text changes, or at
             // its end.
             if matches!(put, Err((_, true))) && live.written.cards == before {
-                live.latest = Some((text, live.written.buttons.clone(), waiting));
+                live.latest = Some((text, live.written.buttons.clone()));
             }
             live.next = tokio::time::Instant::now() + LIVE_EVERY;
         }
@@ -525,7 +538,9 @@ impl Replies {
     /// Take `w`: its text for its reply's cards, or for new ones (below a
     /// part of it shown, which loses its buttons); nothing for a reply that
     /// ended, or that has no one to go to. One that only says the reply is
-    /// still being written shows nothing and keeps it.
+    /// still being written shows nothing and keeps it; so does one that only
+    /// says it is being written: a reply opens its card with its first
+    /// text, and a part keeps its button until the next call has text.
     pub async fn writing(&mut self, lark: &LarkClient, w: types::ChannelWriting) {
         if self.ended.contains(&w.reply) {
             return;
@@ -533,19 +548,29 @@ impl Replies {
         let now = tokio::time::Instant::now();
         if let Some(live) = self.live.get_mut(&w.reply) {
             live.seen = now;
-            if w.alive {
+            if w.alive || w.waiting {
                 return;
             }
             if std::mem::take(&mut live.part) {
                 live.written.drop_buttons(lark).await;
                 live.written = live.written.below();
             }
-            live.latest = Some((w.text, w.buttons, w.waiting));
+            live.latest = Some((w.text, w.buttons));
             return;
         }
         if w.alive {
             return;
         }
+        if w.waiting {
+            if !self.unopened.contains(&w.reply) {
+                self.unopened.push_back(w.reply);
+                while self.unopened.len() > LIVE_KEPT {
+                    self.unopened.pop_front();
+                }
+            }
+            return;
+        }
+        self.unopened.retain(|r| *r != w.reply);
         let Some((kind, id)) = crate::recipient(&w.to) else {
             warn!(to = %w.to, "lark: a reply being written for no one; dropping");
             self.end(w.reply);
@@ -561,7 +586,7 @@ impl Replies {
             w.reply.clone(),
             Live {
                 written: Written::new(&w.reply, &w.to, (kind, id.to_string()), answers),
-                latest: Some((w.text, w.buttons, w.waiting)),
+                latest: Some((w.text, w.buttons)),
                 next: now,
                 part: false,
                 seen: now,
@@ -577,83 +602,59 @@ impl Replies {
     }
 
     /// Show `o`, a part of a reply being written or its end, in that
-    /// reply's cards; one that is not, or whose reply is not shown, goes as
-    /// any other. The end takes the buttons off; one with nothing to show
-    /// leaves its cards showing nothing.
+    /// reply's cards: whether it was; one that is not, or whose reply is not
+    /// shown, goes as any other. The end takes the buttons off; one with
+    /// nothing more to say leaves its cards as they are.
     ///
     /// One with buttons or a question, or a file, goes as any reply: what
-    /// was shown of its call is finished as it is (its text stays, its
-    /// Stop button goes), and a card that only said the reply was being
-    /// written becomes its first card when it is a card ([`Taken::Into`]),
-    /// else shows nothing. After a part, the next call goes below it.
-    pub async fn reply(&mut self, lark: &LarkClient, o: &ChannelOutbound) -> Taken {
+    /// was shown of its call is finished as it is (its text stays, its Stop
+    /// button goes), and the reply ends with it or, after a part, goes on
+    /// below it.
+    pub async fn reply(&mut self, lark: &LarkClient, o: &ChannelOutbound) -> bool {
         let Some(reply) = &o.reply else {
-            return Taken::Deliver;
-        };
-        let text = match &o.content {
-            ChannelMessageContent::Text { text } if o.buttons.is_empty() && o.poll.is_none() => {
-                text
-            }
-            content => {
-                let Some(live) = self.live.get_mut(reply) else {
-                    return Taken::Deliver;
-                };
-                live.seen = tokio::time::Instant::now();
-                live.latest = None;
-                let mut taken = Taken::Deliver;
-                if std::mem::take(&mut live.part) {
-                    live.written.drop_buttons(lark).await;
-                    live.written = live.written.below();
-                } else if live.written.waiting && live.written.cards.len() == 1 {
-                    let id = live.written.cards[0].id.clone();
-                    if matches!(content, ChannelMessageContent::Text { .. }) {
-                        taken = Taken::Into(id);
-                    } else {
-                        retire(lark, &id).await;
-                    }
-                    live.written.cards.clear();
-                } else {
-                    live.written.drop_buttons(lark).await;
-                }
-                live.written.waiting = false;
-                if o.partial {
-                    live.part = true;
-                } else {
-                    self.end(reply.clone());
-                }
-                return taken;
-            }
+            return false;
         };
         let Some(live) = self.live.get_mut(reply) else {
-            return Taken::Deliver;
+            // One that showed no card yet goes as any reply.
+            if !o.partial && self.unopened.contains(reply) {
+                self.end(reply.clone());
+            }
+            return false;
         };
         live.seen = tokio::time::Instant::now();
         live.latest = None;
-        if std::mem::take(&mut live.part) {
-            live.written.drop_buttons(lark).await;
-            live.written = live.written.below();
-        }
-        live.written.show(lark, text, o.partial, true).await;
-        live.written.waiting = false;
+        let text = match &o.content {
+            ChannelMessageContent::Text { text } if o.buttons.is_empty() && o.poll.is_none() => {
+                Some(text)
+            }
+            _ => None,
+        };
+        let shown = match text {
+            Some(text) if o.partial || !text.trim().is_empty() => {
+                if std::mem::take(&mut live.part) {
+                    live.written.drop_buttons(lark).await;
+                    live.written = live.written.below();
+                }
+                live.written.show(lark, text, o.partial, true).await;
+                true
+            }
+            // An end that says nothing more, buttons, a question, a file:
+            // what was shown stays, without its button.
+            empty => {
+                live.written.drop_buttons(lark).await;
+                if std::mem::take(&mut live.part) {
+                    live.written = live.written.below();
+                }
+                empty.is_some()
+            }
+        };
         if o.partial {
             live.part = true;
         } else {
             self.end(reply.clone());
         }
-        Taken::Shown
+        shown
     }
-}
-
-/// What became of an outbound a reply being written may take.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Taken {
-    /// Shown in its reply's cards.
-    Shown,
-    /// To be delivered as any reply.
-    Deliver,
-    /// To be delivered, its first card in the place of this one, which
-    /// only said the reply was being written.
-    Into(String),
 }
 
 #[cfg(test)]
@@ -730,14 +731,13 @@ mod tests {
         LarkClient::unauthenticated("http://127.0.0.1:9".into(), "a".into(), "s".into()).unwrap()
     }
 
-    fn live_of(cards: Vec<Shown>, waiting: bool) -> Live {
+    fn live_of(cards: Vec<Shown>) -> Live {
         let now = tokio::time::Instant::now();
         let mut written = Written::new("rid", "lark:on_a", ("union_id", "on_a".into()), None);
         written.cards = cards;
-        written.waiting = waiting;
         Live {
             written,
-            latest: Some(("stale".into(), Vec::new(), false)),
+            latest: Some(("stale".into(), Vec::new())),
             next: now,
             part: false,
             seen: now,
@@ -766,25 +766,75 @@ mod tests {
         }
     }
 
+    fn frame(text: &str, waiting: bool) -> types::ChannelWriting {
+        types::ChannelWriting {
+            account_id: "bot".into(),
+            to: "lark:on_a".into(),
+            in_reply_to: None,
+            reply: "rid".into(),
+            text: text.into(),
+            buttons: Vec::new(),
+            waiting,
+            alive: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reply_opens_its_card_only_with_its_first_text() {
+        let lark = lark();
+        let mut replies = Replies::default();
+        replies.writing(&lark, frame("Replying…", true)).await;
+        assert!(
+            !replies.any() && replies.due().is_none(),
+            "no card for the line alone"
+        );
+        // An end that comes before any text goes as any reply, and ends it.
+        assert!(
+            !replies
+                .reply(
+                    &lark,
+                    &end_of(ChannelMessageContent::Text { text: "Hi".into() }, false)
+                )
+                .await
+        );
+        assert!(replies.ended.contains(&"rid".to_string()) && replies.unopened.is_empty());
+        // Another, which gets text: its card opens then.
+        replies.ended.clear();
+        replies.writing(&lark, frame("Replying…", true)).await;
+        replies.writing(&lark, frame("Hel", false)).await;
+        assert!(replies.any() && replies.unopened.is_empty());
+        assert_eq!(
+            replies.live["rid"].latest.as_ref().map(|l| l.0.as_str()),
+            Some("Hel")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_part_keeps_its_button_until_the_next_call_has_text() {
+        let lark = lark();
+        let mut replies = Replies::default();
+        let mut live = live_of(vec![shown("the part", true)]);
+        live.part = true;
+        live.latest = None;
+        replies.live.insert("rid".into(), live);
+        replies.writing(&lark, frame("Replying…", true)).await;
+        let live = &replies.live["rid"];
+        assert!(live.part && live.written.cards.len() == 1 && live.latest.is_none());
+    }
+
     #[tokio::test]
     async fn a_reply_ending_on_a_file_is_ended_and_a_part_that_is_one_goes_below() {
         let lark = lark();
         let mut replies = Replies::default();
         replies
             .live
-            .insert("rid".into(), live_of(vec![shown("so far", false)], false));
+            .insert("rid".into(), live_of(vec![shown("so far", false)]));
         replies.order.push_back("rid".into());
         // A file as a part: delivered as any reply; the next call goes below it.
-        assert_eq!(
-            replies.reply(&lark, &end_of(file(), true)).await,
-            Taken::Deliver
-        );
+        assert!(!replies.reply(&lark, &end_of(file(), true)).await);
         assert!(replies.live["rid"].part && replies.live["rid"].latest.is_none());
         // A file as its end: delivered, and the reply ends.
-        assert_eq!(
-            replies.reply(&lark, &end_of(file(), false)).await,
-            Taken::Deliver
-        );
+        assert!(!replies.reply(&lark, &end_of(file(), false)).await);
         assert!(!replies.any() && replies.ended.contains(&"rid".to_string()));
     }
 
@@ -792,7 +842,7 @@ mod tests {
     async fn buttons_after_a_part_leave_no_stop_button_nor_old_text() {
         let lark = lark();
         let mut replies = Replies::default();
-        let mut live = live_of(vec![shown("the part", false)], false);
+        let mut live = live_of(vec![shown("the part", false)]);
         live.part = true;
         replies.live.insert("rid".into(), live);
         let mut asked = end_of(
@@ -805,7 +855,7 @@ mod tests {
             label: "Red".into(),
             data: "/choose 1".into(),
         }]];
-        assert_eq!(replies.reply(&lark, &asked).await, Taken::Deliver);
+        assert!(!replies.reply(&lark, &asked).await);
         let live = &replies.live["rid"];
         assert!(
             live.latest.is_none(),
@@ -816,36 +866,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_question_goes_in_the_card_that_said_the_reply_was_being_written() {
+    async fn an_end_with_nothing_more_to_say_leaves_what_was_shown() {
         let lark = lark();
         let mut replies = Replies::default();
         replies
             .live
-            .insert("rid".into(), live_of(vec![shown("Replying", true)], true));
-        let mut asked = end_of(
+            .insert("rid".into(), live_of(vec![shown("all of it", false)]));
+        let end = end_of(
             ChannelMessageContent::Text {
-                text: "Which?".into(),
+                text: String::new(),
             },
             false,
         );
-        asked.buttons = vec![vec![types::Button {
-            label: "Red".into(),
-            data: "/choose 1".into(),
-        }]];
-        assert_eq!(
-            replies.reply(&lark, &asked).await,
-            Taken::Into("om_Replying".into())
-        );
+        assert!(replies.reply(&lark, &end).await, "nothing to deliver");
         assert!(!replies.any());
-        // A file cannot go in a card: that one is made to show nothing.
-        replies.ended.clear();
-        replies
-            .live
-            .insert("rid".into(), live_of(vec![shown("Replying", true)], true));
-        assert_eq!(
-            replies.reply(&lark, &end_of(file(), false)).await,
-            Taken::Deliver
-        );
     }
 
     #[tokio::test]
