@@ -54,6 +54,18 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
+/// Lark said to slow down, and the call was not to wait: how long it asks.
+#[derive(Debug)]
+pub struct SlowDown(pub Duration);
+
+impl std::fmt::Display for SlowDown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Lark asks to slow down for {} ms", self.0.as_millis())
+    }
+}
+
+impl std::error::Error for SlowDown {}
+
 /// A message sent: its id, and the chat it went to.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Sent {
@@ -186,7 +198,52 @@ impl LarkClient {
             .post(self.url("/open-apis/im/v1/messages"))
             .query(&[("receive_id_type", receive_id_type)])
             .json(&body);
-        self.send_message_req(req).await
+        self.send_message_req(req, true).await
+    }
+
+    /// [`Self::send_message`] or, with `reply_to`, [`Self::reply_message`];
+    /// when Lark says to slow down, waiting only when `patient`, else
+    /// failing with [`SlowDown`].
+    pub async fn post_message(
+        &self,
+        reply_to: Option<&str>,
+        to: (&str, &str),
+        msg_type: &str,
+        content: &str,
+        patient: bool,
+    ) -> Result<Sent> {
+        let req = match reply_to {
+            Some(message_id) => self
+                .http
+                .post(self.url_of(&["open-apis", "im", "v1", "messages", message_id, "reply"]))
+                .json(&json!({ "msg_type": msg_type, "content": content })),
+            None => self
+                .http
+                .post(self.url("/open-apis/im/v1/messages"))
+                .query(&[("receive_id_type", to.0)])
+                .json(&json!({ "receive_id": to.1, "msg_type": msg_type, "content": content })),
+        };
+        self.send_message_req(req, patient).await
+    }
+
+    /// Put `card` (its JSON) in the place of card message `message_id`,
+    /// which the bot sent: Lark takes 5 a second of one message. When Lark
+    /// says to slow down, it waits only when `patient`, else fails with
+    /// [`SlowDown`].
+    pub async fn update_card(&self, message_id: &str, card: &str, patient: bool) -> Result<()> {
+        let req = self
+            .http
+            .patch(self.url_of(&["open-apis", "im", "v1", "messages", message_id]))
+            .json(&json!({ "content": card }));
+        self.call(req, patient).await.map(|_| ())
+    }
+
+    /// Take down message `message_id`, which the bot sent.
+    pub async fn delete_message(&self, message_id: &str) -> Result<()> {
+        let req = self
+            .http
+            .delete(self.url_of(&["open-apis", "im", "v1", "messages", message_id]));
+        self.call(req, true).await.map(|_| ())
     }
 
     /// Reply to an existing message (threads under it).
@@ -201,26 +258,39 @@ impl LarkClient {
             .http
             .post(self.url_of(&["open-apis", "im", "v1", "messages", message_id, "reply"]))
             .json(&body);
-        self.send_message_req(req).await
+        self.send_message_req(req, true).await
     }
 
-    /// Execute a send/reply request: the token refreshed once when Lark
-    /// says it expired, and sent again after the wait Lark asks for when it
-    /// says to slow down ([`slowed_down`]), up to [`SLOW_DOWN_TRIES`] times.
-    async fn send_message_req(&self, req: reqwest::RequestBuilder) -> Result<Sent> {
+    /// A send or reply request, as [`Self::call`]: the message sent.
+    async fn send_message_req(&self, req: reqwest::RequestBuilder, patient: bool) -> Result<Sent> {
+        #[derive(Deserialize)]
+        struct SendData {
+            message_id: String,
+            #[serde(default)]
+            chat_id: String,
+        }
+        let data = self.call(req, patient).await?;
+        let sent: SendData =
+            serde_json::from_value(data).context("send response missing message_id")?;
+        Ok(Sent {
+            message_id: sent.message_id,
+            chat_id: sent.chat_id,
+        })
+    }
+
+    /// Make a call of the IM API: its `data`. The token is refreshed once
+    /// when Lark says it expired; when Lark says to slow down
+    /// ([`slowed_down`]), the call is made again after the wait it asks for,
+    /// up to [`SLOW_DOWN_TRIES`] times, when `patient`, and else fails with
+    /// [`SlowDown`].
+    async fn call(&self, req: reqwest::RequestBuilder, patient: bool) -> Result<serde_json::Value> {
         #[derive(Deserialize)]
         struct SendResp {
             code: i64,
             #[serde(default)]
             msg: String,
             #[serde(default)]
-            data: Option<SendData>,
-        }
-        #[derive(Deserialize)]
-        struct SendData {
-            message_id: String,
-            #[serde(default)]
-            chat_id: String,
+            data: Option<serde_json::Value>,
         }
         let mut refreshed = false;
         let mut slowed = 0u32;
@@ -232,7 +302,7 @@ impl LarkClient {
                 .header("Authorization", self.bearer().await)
                 .send()
                 .await
-                .context("POST im/v1 message")?;
+                .context("calling Lark's IM API")?;
             let status = resp.status();
             let reset = resp
                 .headers()
@@ -264,6 +334,9 @@ impl LarkClient {
                 continue;
             }
             if let Some(wait) = slowed_down(status, parsed.code, reset, slowed) {
+                if !patient {
+                    return Err(SlowDown(wait).into());
+                }
                 warn!(
                     code = parsed.code,
                     wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
@@ -280,13 +353,7 @@ impl LarkClient {
                 }
                 .into());
             }
-            return parsed
-                .data
-                .map(|d| Sent {
-                    message_id: d.message_id,
-                    chat_id: d.chat_id,
-                })
-                .context("send response missing message_id");
+            return Ok(parsed.data.unwrap_or(serde_json::Value::Null));
         }
     }
 

@@ -563,39 +563,38 @@ impl Incoming {
             warn!(message = %ev.context.open_message_id, "lark: a card pressed by someone it was not sent to");
             return toast("error", "This is not yours to answer.");
         }
-        let said = if value.get(card::KIND).and_then(Value::as_str) == Some(card::QUESTION) {
-            let numbers: Vec<String> = ev
-                .action
-                .form_value
-                .get(card::CHOICES)
-                .and_then(Value::as_array)
-                .map(|chosen| {
-                    chosen
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .filter(|n| n.parse::<u32>().is_ok())
-                        .map(String::from)
-                        .collect()
-                })
-                .unwrap_or_default();
-            if numbers.is_empty() {
-                return toast("warning", "Choose at least one.");
-            }
-            let answer = value
-                .get(card::ANSWER)
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            format!("{answer} {}", numbers.join(","))
-        } else {
-            match value.get(card::SAID).and_then(Value::as_str) {
-                Some(said) if !said.is_empty() => said.to_string(),
-                _ => return json!({}),
-            }
+        let said = match said_of(value, &ev.action.form_value) {
+            Ok(said) => said,
+            Err(answer) => return answer,
         };
         let message_id = ev.context.open_message_id.clone();
         let mut ids_of_sender = aliases;
         ids_of_sender.push(sender.clone());
         let private = self.people().chat_of(&ids_of_sender);
+        // A reply's Stop button (havn issue #325): `/stop` from the person,
+        // in their chat, while the reply is written; a person's presses
+        // within 5 seconds count once. The button stays until the reply ends.
+        match crate::live::stop_of(&said, &sender) {
+            crate::live::Pressed::Other => {}
+            crate::live::Pressed::Again => return json!({}),
+            crate::live::Pressed::Spent => return toast("info", "This reply has ended."),
+            crate::live::Pressed::Stop(_) => {
+                let queued = self.to_chat(
+                    private.unwrap_or_else(|| sender.clone()),
+                    Arrival::Said {
+                        ids,
+                        message_id: format!("{PRESS_PREFIX}{message_id}"),
+                        text: "/stop".into(),
+                        raw,
+                        react_on: None,
+                    },
+                );
+                if !queued {
+                    return toast("warning", "Busy; try again in a moment.");
+                }
+                return json!({});
+            }
+        }
         // With the cards' lock held, so a card is marked pressed only once,
         // and only once its press is on its way.
         let mut cards = self
@@ -680,6 +679,38 @@ impl Incoming {
     }
 }
 
+/// What a press of a button with callback `value` sends: the button's
+/// command, or a question's answer and the numbers chosen in `form`; else
+/// what Lark is answered with, sending nothing.
+fn said_of(value: &Value, form: &Value) -> Result<String, Value> {
+    if value.get(card::KIND).and_then(Value::as_str) == Some(card::QUESTION) {
+        let numbers: Vec<String> = form
+            .get(card::CHOICES)
+            .and_then(Value::as_array)
+            .map(|chosen| {
+                chosen
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|n| n.parse::<u32>().is_ok())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if numbers.is_empty() {
+            return Err(toast("warning", "Choose at least one."));
+        }
+        let answer = value
+            .get(card::ANSWER)
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return Ok(format!("{answer} {}", numbers.join(",")));
+    }
+    match value.get(card::SAID).and_then(Value::as_str) {
+        Some(said) if !said.is_empty() => Ok(said.to_string()),
+        _ => Err(json!({})),
+    }
+}
+
 /// A toast answering a press, of Lark's `type` (info, success, warning,
 /// error).
 fn toast(kind: &str, content: &str) -> Value {
@@ -709,9 +740,13 @@ async fn translate_and_forward(incoming: Incoming, arrival: Arrival) {
             else {
                 return;
             };
-            incoming
-                .working
-                .start(&sender, &m.message_id, &m.message_id);
+            // A typed /stop gets no reply of its own.
+            if !matches!(&content, ChannelMessageContent::Text { text } if crate::live::is_stop(text))
+            {
+                incoming
+                    .working
+                    .start(&sender, &m.message_id, &m.message_id);
+            }
             let timestamp = m
                 .create_time
                 .as_deref()
@@ -1098,7 +1133,7 @@ impl Working {
 
     /// The messages waiting for a reply to `to`.
     #[cfg(test)]
-    fn waiting(&self, to: &str) -> Vec<String> {
+    pub(crate) fn waiting(&self, to: &str) -> Vec<String> {
         self.chats()
             .get(to)
             .map(|q| q.iter().map(|s| s.message_id.clone()).collect())
