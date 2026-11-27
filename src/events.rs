@@ -291,6 +291,11 @@ impl Incoming {
             debug!(message_id = %ev.message.message_id, "lark: a message taken before; dropping");
             return Taken::Done;
         }
+        // Another bot's, or the bot's own: not a person's to answer.
+        if !ev.sender.sender_type.is_empty() && ev.sender.sender_type != "user" {
+            debug!(sender_type = %ev.sender.sender_type, "lark: a message of a bot; dropping");
+            return Taken::Done;
+        }
         // Translate + forward off the answer's path (Lark wants it within
         // 3s; STT/download can take longer), in the order of its chat, or
         // of its conversation in a group: the group or its thread.
@@ -916,9 +921,9 @@ async fn translate_message(
     let (said, mentioned) = written_of(m, &payload);
     let group = match &place {
         Some(place) => {
-            // Only a bot that gets every message gets one without a
-            // mention of it (known once Lark said who the bot is).
-            if !mentioned && group::bot().is_some() {
+            // Only a bot that gets every message gets one that mentions
+            // neither it (known once Lark said who the bot is) nor everyone.
+            if !mentioned && !mentions_everyone(m, &payload) && group::bot().is_some() {
                 group::saw_all();
             }
             let addressed = mentioned
@@ -997,6 +1002,34 @@ fn written_of(m: &crate::lark::LarkMessage, payload: &Value) -> (Option<String>,
         _ => None,
     };
     (said, mentioned)
+}
+
+/// Whether message `m` (`payload` its content) mentions everyone: a bot
+/// that gets only mentions may get it.
+fn mentions_everyone(m: &crate::lark::LarkMessage, payload: &Value) -> bool {
+    let all = |key: &str| key == "@_all" || key == "all";
+    if m.mentions.iter().any(|x| all(&x.key)) {
+        return true;
+    }
+    match m.message_type.as_str() {
+        "text" => payload
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.contains("@_all")),
+        "post" => payload
+            .as_object()
+            .into_iter()
+            .flat_map(|langs| langs.values())
+            .filter_map(|lang| lang.get("content").and_then(Value::as_array))
+            .flatten()
+            .filter_map(Value::as_array)
+            .flatten()
+            .any(|el| {
+                el.get("tag").and_then(Value::as_str) == Some("at")
+                    && el.get("user_id").and_then(Value::as_str).is_some_and(all)
+            }),
+        _ => false,
+    }
 }
 
 /// A group's message not to the bot, as it is kept for context: its text, or
@@ -1216,11 +1249,21 @@ fn failure(e: &anyhow::Error) -> &'static str {
 /// answers which message, so a chat's messages are answered in turn, the
 /// oldest first; a part of a reply with more to come leaves it on. One that
 /// gets no reply goes after [`WORKING_FOR`].
+///
+/// A gateway that shows replies as they are written says every minute that
+/// one is: a message whose conversation heard none of that for
+/// [`QUIET_FOR`] gets no reply of the agent's (the gateway turned it away
+/// without naming it, or answered a command as `/new` without), and loses
+/// its reaction.
 #[derive(Clone)]
 pub struct Working {
     lark: Arc<LarkClient>,
     chats: Arc<Mutex<HashMap<String, VecDeque<Shown>>>>,
     next: Arc<AtomicU64>,
+    /// When each conversation last heard that a reply is being written.
+    written: Arc<Mutex<HashMap<String, std::time::Instant>>>,
+    /// The gateway shows replies as they are written.
+    writing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A message with the reaction on, or being put on.
@@ -1235,6 +1278,13 @@ struct Shown {
 
 const WORKING_EMOJI: &str = "Typing";
 const WORKING_FOR: std::time::Duration = std::time::Duration::from_mins(5);
+/// How often a message's reaction is looked at, and how long its
+/// conversation may hear nothing being written: the gateway says it every
+/// minute while a reply is.
+const QUIET_EVERY: std::time::Duration = std::time::Duration::from_secs(45);
+const QUIET_FOR: std::time::Duration = std::time::Duration::from_secs(75);
+/// Conversations whose last writing is kept at most.
+const WRITTEN_KEPT: usize = 4096;
 
 impl Working {
     pub fn new(lark: Arc<LarkClient>) -> Self {
@@ -1242,7 +1292,41 @@ impl Working {
             lark,
             chats: Arc::default(),
             next: Arc::new(AtomicU64::new(0)),
+            written: Arc::default(),
+            writing: Arc::default(),
         }
+    }
+
+    /// A reply is being written to `to`: its messages' reactions stay.
+    pub fn being_written(&self, to: &str) {
+        self.writing.store(true, Ordering::Relaxed);
+        let mut written = self
+            .written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if written.len() >= WRITTEN_KEPT && !written.contains_key(to) {
+            written.retain(|_, at| at.elapsed() < QUIET_FOR);
+        }
+        written.insert(to.to_string(), std::time::Instant::now());
+    }
+
+    /// Whether `to` heard that a reply is being written in the last
+    /// [`QUIET_FOR`], or the gateway does not say it.
+    fn heard(&self, to: &str) -> bool {
+        !self.writing.load(Ordering::Relaxed)
+            || self
+                .written
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(to)
+                .is_some_and(|at| at.elapsed() < QUIET_FOR)
+    }
+
+    /// Whether message `id` of `to` still shows its reaction.
+    fn shows(&self, to: &str, id: u64) -> bool {
+        self.chats()
+            .get(to)
+            .is_some_and(|q| q.iter().any(|s| s.id == id))
     }
 
     fn chats(&self) -> std::sync::MutexGuard<'_, HashMap<String, VecDeque<Shown>>> {
@@ -1291,8 +1375,17 @@ impl Working {
                     debug!(error = %format!("{e:#}"), "lark: could not show that a reply is due");
                 }
             }
-            tokio::time::sleep(WORKING_FOR).await;
-            this.end(&to, |s| s.id == id);
+            let until = tokio::time::Instant::now() + WORKING_FOR;
+            loop {
+                tokio::time::sleep(QUIET_EVERY).await;
+                if !this.shows(&to, id) {
+                    return;
+                }
+                if tokio::time::Instant::now() >= until || !this.heard(&to) {
+                    this.end(&to, |s| s.id == id);
+                    return;
+                }
+            }
         });
     }
 
@@ -1841,6 +1934,55 @@ mod tests {
         working.replied("lark:on_a", None);
         assert_eq!(working.waiting("lark:on_a"), Vec::<String>::new());
         assert_eq!(working.waiting("lark:on_b"), ["om_3"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reaction_comes_off_when_nothing_is_written_for_its_message() {
+        let (incoming, _rx) = incoming(None, None);
+        let working = &incoming.working;
+        working.being_written("lark:on_other");
+        working.start("lark:on_a", "om_quiet", "om_quiet");
+        working.start("lark:on_b", "om_busy", "om_busy");
+        for _ in 0..6 {
+            working.being_written("lark:on_b");
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+        // Nothing written for it: off; its reply being written: on.
+        assert_eq!(working.waiting("lark:on_a"), Vec::<String>::new());
+        assert_eq!(working.waiting("lark:on_b"), ["om_busy"]);
+        // Past WORKING_FOR, off whatever is written.
+        for _ in 0..8 {
+            working.being_written("lark:on_b");
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+        assert_eq!(working.waiting("lark:on_b"), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_bot_s_message_is_not_passed_on() {
+        let (incoming, mut rx) = incoming(None, None);
+        let mut event = message_event("b1", "om_b1", "");
+        event["event"]["sender"]["sender_type"] = json!("app");
+        assert_eq!(incoming.take(event), Taken::Done);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_mention_of_everyone_is_told_apart() {
+        let message = |kind: &str, content: Value| -> crate::lark::LarkMessage {
+            serde_json::from_value(json!({
+                "message_id": "om_1", "chat_id": "oc_1", "chat_type": "group",
+                "message_type": kind, "content": content.to_string()
+            }))
+            .unwrap()
+        };
+        let text = json!({"text": "@_all lunch"});
+        assert!(mentions_everyone(&message("text", text.clone()), &text));
+        let text = json!({"text": "lunch"});
+        assert!(!mentions_everyone(&message("text", text.clone()), &text));
+        let post = json!({"zh_cn": {"content": [[{"tag": "at", "user_id": "all"}]]}});
+        assert!(mentions_everyone(&message("post", post.clone()), &post));
     }
 
     #[test]

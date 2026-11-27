@@ -11,8 +11,8 @@
 //!
 //! Lark gives a bot without the permission to read every group message only
 //! the messages that mention it: the permissions the tenant granted are
-//! asked when the daemon starts and every half hour, and a message that does
-//! not mention the bot shows it has one.
+//! asked when the daemon starts and every half hour. Until Lark answers, a
+//! message that mentions neither the bot nor everyone shows it has one.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -136,19 +136,27 @@ pub fn is_command(text: &str) -> bool {
 /// What the tenant's permissions say of the bot's groups: 0 not known, 1 it
 /// gets only mentions, 2 every message.
 static SCOPES_SEE_ALL: AtomicU8 = AtomicU8::new(0);
-/// A group message that does not mention the bot came: it gets every one.
+/// A group message that mentions neither the bot nor everyone came: it gets
+/// every one.
 static SAW_ALL: AtomicBool = AtomicBool::new(false);
 
 /// Whether the bot sees every message of its groups, where known. Lark
 /// grants it to the app, for all of them.
 pub fn sees_all() -> Option<bool> {
-    if SAW_ALL.load(Ordering::Relaxed) {
-        return Some(true);
-    }
-    match SCOPES_SEE_ALL.load(Ordering::Relaxed) {
+    seeing(
+        SCOPES_SEE_ALL.load(Ordering::Relaxed),
+        SAW_ALL.load(Ordering::Relaxed),
+    )
+}
+
+/// Whether the bot sees every message, from what the permissions said
+/// (`scopes`, as [`SCOPES_SEE_ALL`]) and whether a message showed it (`saw`):
+/// the permissions, once Lark said them; else what a message showed.
+fn seeing(scopes: u8, saw: bool) -> Option<bool> {
+    match scopes {
         1 => Some(false),
         2 => Some(true),
-        _ => None,
+        _ => saw.then_some(true),
     }
 }
 
@@ -162,10 +170,11 @@ pub fn reaches(all: bool) -> Vec<Reach> {
     }
 }
 
-/// A group message that does not mention the bot came: only a bot that gets
-/// every message gets one.
+/// A group message that mentions neither the bot nor everyone came: only a
+/// bot that gets every message gets one. The permissions, once Lark said
+/// them, say otherwise.
 pub fn saw_all() {
-    if !SAW_ALL.swap(true, Ordering::Relaxed) && SCOPES_SEE_ALL.load(Ordering::Relaxed) != 2 {
+    if !SAW_ALL.swap(true, Ordering::Relaxed) && SCOPES_SEE_ALL.load(Ordering::Relaxed) == 0 {
         info!("lark: a group message that does not mention the bot came: it sees every message");
     }
 }
@@ -176,6 +185,8 @@ pub async fn learn_scopes(lark: &LarkClient) {
         Ok(scopes) => {
             let all = scopes.iter().any(|s| SEE_ALL_SCOPES.contains(&s.as_str()));
             let was = SCOPES_SEE_ALL.swap(if all { 2 } else { 1 }, Ordering::Relaxed);
+            // What a message showed is the permissions' to say now.
+            SAW_ALL.store(all, Ordering::Relaxed);
             if was != SCOPES_SEE_ALL.load(Ordering::Relaxed) {
                 if all {
                     info!("lark: the bot may read every group message");
@@ -291,11 +302,15 @@ pub async fn is_ours(lark: &LarkClient, id: &str) -> bool {
     }
 }
 
-/// A thread: the group it is in, and the message what goes to it replies to.
+/// A thread: the group it is in, and the message what goes to it replies to;
+/// `gone` once Lark said that message or the thread is gone, and what goes
+/// to the thread goes to the group.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Thread {
     pub chat: String,
     pub anchor: String,
+    #[serde(default)]
+    pub gone: bool,
 }
 
 /// What is known of the groups.
@@ -351,25 +366,59 @@ pub fn keep_beside(state: Option<&Path>) {
     let _ = THREADS_FILE.set(path);
 }
 
-/// Write the threads to [`THREADS_FILE`], the file replaced whole.
-fn save_threads(known: &Known) {
+/// How long after a change of the threads they are written: changes in
+/// that time go in one write.
+const SAVE_AFTER: Duration = Duration::from_secs(1);
+/// A write of the threads is due.
+static SAVE_DUE: AtomicBool = AtomicBool::new(false);
+/// Held while the threads are written, so an older write cannot come after
+/// a newer one.
+static SAVING: Mutex<()> = Mutex::new(());
+
+/// The threads changed: they are written to [`THREADS_FILE`] a moment later,
+/// off the path that takes Lark's events, the file replaced whole.
+fn save_threads() {
+    if THREADS_FILE.get().is_none() || SAVE_DUE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        SAVE_DUE.store(false, Ordering::Release);
+        write_threads();
+        return;
+    };
+    runtime.spawn(async {
+        tokio::time::sleep(SAVE_AFTER).await;
+        SAVE_DUE.store(false, Ordering::Release);
+        if tokio::task::spawn_blocking(write_threads).await.is_err() {
+            warn!("lark: keeping the threads failed");
+        }
+    });
+}
+
+/// Write the threads as they are now to [`THREADS_FILE`].
+fn write_threads() {
     let Some(path) = THREADS_FILE.get() else {
         return;
     };
-    let kept: Vec<(&String, &Thread)> = known
-        .thread_order
-        .iter()
-        .filter_map(|id| known.threads.get(id).map(|t| (id, t)))
-        .collect();
-    let written = serde_json::to_vec(&kept)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| {
-            let mut part = path.as_os_str().to_owned();
-            part.push(".part");
-            let part = PathBuf::from(part);
-            std::fs::write(&part, bytes)?;
-            std::fs::rename(&part, path)
-        });
+    let _saving = SAVING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let bytes = {
+        let known = known();
+        let kept: Vec<(&String, &Thread)> = known
+            .thread_order
+            .iter()
+            .filter_map(|id| known.threads.get(id).map(|t| (id, t)))
+            .collect();
+        serde_json::to_vec(&kept)
+    };
+    let written = bytes.map_err(std::io::Error::other).and_then(|bytes| {
+        let mut part = path.as_os_str().to_owned();
+        part.push(".part");
+        let part = PathBuf::from(part);
+        std::fs::write(&part, bytes)?;
+        std::fs::rename(&part, path)
+    });
     if let Err(e) = written {
         warn!(path = %path.display(), error = %e, "lark: could not keep the threads");
     }
@@ -387,6 +436,7 @@ pub fn note_thread(thread: &str, chat: &str, anchor: &str) {
         Thread {
             chat: chat.to_string(),
             anchor: anchor.to_string(),
+            gone: false,
         },
     );
     known.thread_order.push_back(thread.to_string());
@@ -395,12 +445,29 @@ pub fn note_thread(thread: &str, chat: &str, anchor: &str) {
             known.threads.remove(&oldest);
         }
     }
-    save_threads(&known);
+    drop(known);
+    save_threads();
 }
 
 /// Thread `thread`, when one of its messages came.
 pub fn thread(thread: &str) -> Option<Thread> {
     known().threads.get(thread).cloned()
+}
+
+/// Lark said the thread whose first message is `anchor` is gone, or that
+/// message is: its group, from now on where what goes to the thread goes,
+/// and whether this is the first time it was said.
+pub fn thread_gone(anchor: &str) -> Option<(String, bool)> {
+    let mut known = known();
+    let thread = known.threads.values_mut().find(|t| t.anchor == anchor)?;
+    let first = !std::mem::replace(&mut thread.gone, true);
+    let chat = thread.chat.clone();
+    drop(known);
+    if first {
+        warn!(group = %format!("{PREFIX}{chat}"), "lark: a thread is gone; what goes to it goes to its group");
+        save_threads();
+    }
+    Some((chat, first))
 }
 
 /// The bot was added to group `chat`, named `name`.
@@ -430,7 +497,8 @@ pub fn removed(chat: &str) {
             ..
         } = &mut *known;
         thread_order.retain(|id| threads.contains_key(id));
-        save_threads(&known);
+        drop(known);
+        save_threads();
     }
 }
 
@@ -566,7 +634,8 @@ impl Place {
             sender_name: name(lark, &self.chat, open_id).await,
             addressed,
             sees_all: sees_all(),
-            reaches: sees_all().map(reaches),
+            // Mentions reach it whatever its permissions.
+            reaches: Some(reaches(sees_all().unwrap_or(false))),
             space: None,
             thread: self.thread.as_ref().map(|t| ChannelPlace {
                 id: format!("{PREFIX}{t}"),
@@ -623,6 +692,46 @@ mod tests {
             written("@_user_1 hi", &mentions, None),
             ("@Acme hi".to_string(), false)
         );
+    }
+
+    #[test]
+    fn the_permissions_say_whether_the_bot_sees_every_message() {
+        // Until Lark says, a message that showed it.
+        assert_eq!(seeing(0, false), None);
+        assert_eq!(seeing(0, true), Some(true));
+        // Once Lark said, what it said.
+        assert_eq!(seeing(1, true), Some(false));
+        assert_eq!(seeing(2, false), Some(true));
+    }
+
+    #[test]
+    fn a_gone_thread_s_messages_go_to_its_group() {
+        note_thread("omt_lost", "oc_g3", "om_lost_root");
+        assert_eq!(thread_gone("om_lost_root"), Some(("oc_g3".into(), true)));
+        assert_eq!(thread_gone("om_lost_root"), Some(("oc_g3".into(), false)));
+        assert!(thread("omt_lost").is_some_and(|t| t.gone));
+        assert_eq!(thread_gone("om_unknown"), None);
+    }
+
+    #[tokio::test]
+    async fn the_threads_are_kept_off_the_events_path() {
+        let path = std::env::temp_dir().join(format!("havn-lark-threads-{}", std::process::id()));
+        let _ = std::fs::remove_file(path.with_extension("threads"));
+        keep_beside(Some(&path));
+        let Some(file) = THREADS_FILE.get().cloned() else {
+            panic!("kept beside the state file");
+        };
+        note_thread("omt_kept", "oc_g4", "om_kept_root");
+        let mut kept = String::new();
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            kept = std::fs::read_to_string(&file).unwrap_or_default();
+            if kept.contains("omt_kept") {
+                break;
+            }
+        }
+        assert!(kept.contains("om_kept_root"), "{kept}");
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

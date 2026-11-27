@@ -187,7 +187,10 @@ impl LarkClient {
     /// only when `patient`, else fails with [`SlowDown`].
     ///
     /// A thread (`to` of kind [`THREAD`]) takes no message sent to it: the
-    /// message replies to the one `to` names, in the thread.
+    /// message replies to the one `to` names, in the thread. When the message
+    /// replied to is gone (recalled, or its thread is), the message goes to
+    /// the recipient without it; for a thread, to its first message, else to
+    /// its group, after a line saying why the first time.
     pub async fn post_message(
         &self,
         reply_to: Option<&str>,
@@ -196,7 +199,51 @@ impl LarkClient {
         content: &str,
         patient: bool,
     ) -> Result<Sent> {
-        let reply_to = reply_to.or_else(|| (to.0 == THREAD).then_some(to.1));
+        let thread = to.0 == THREAD;
+        let Some(message_id) = reply_to.or_else(|| thread.then_some(to.1)) else {
+            return self.post(None, to, msg_type, content, patient).await;
+        };
+        match self
+            .post(Some(message_id), to, msg_type, content, patient)
+            .await
+        {
+            Err(e) if gone(&e) => {
+                debug!(error = %format!("{e:#}"), "lark: the message a reply answers is gone; sending it without");
+            }
+            other => return other,
+        }
+        if !thread {
+            return self.post(None, to, msg_type, content, patient).await;
+        }
+        if message_id != to.1 {
+            match self.post(Some(to.1), to, msg_type, content, patient).await {
+                Err(e) if gone(&e) => {}
+                other => return other,
+            }
+        }
+        let Some((chat, first)) = crate::group::thread_gone(to.1) else {
+            bail!("a thread whose first message is gone, of no group known");
+        };
+        let group = ("chat_id", chat.as_str());
+        if first {
+            let note = json!({ "text": THREAD_GONE }).to_string();
+            if let Err(e) = self.post(None, group, "text", &note, patient).await {
+                debug!(error = %format!("{e:#}"), "lark: could not say a thread is gone");
+            }
+        }
+        self.post(None, group, msg_type, content, patient).await
+    }
+
+    /// [`Self::post_message`] without its fallbacks: a reply to `reply_to`
+    /// (in the thread, for `to` a [`THREAD`]), else a message sent to `to`.
+    async fn post(
+        &self,
+        reply_to: Option<&str>,
+        to: (&str, &str),
+        msg_type: &str,
+        content: &str,
+        patient: bool,
+    ) -> Result<Sent> {
         let req = match reply_to {
             Some(message_id) => self
                 .http
@@ -728,6 +775,19 @@ fn sleep_for(expire_s: u64) -> Duration {
 /// it replies to a message in it.
 pub const THREAD: &str = "thread";
 
+/// Said in a group before what went to a thread of it that is gone.
+const THREAD_GONE: &str = "(The thread this answers is gone, so the reply is here.)";
+
+/// Lark's codes for a reply to a message that is gone: recalled, its thread
+/// gone, or about to delete itself (im-v1/message/reply).
+const GONE: [i64; 3] = [230_011, 230_019, 230_111];
+
+/// Whether Lark refused a reply because the message it answers is gone.
+fn gone(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<Refused>()
+        .is_some_and(|r| GONE.contains(&r.code))
+}
+
 // ─────────────────────────── inbound event types ───────────────────────────
 
 /// Decrypted event envelope (event schema 2.0). We only act on
@@ -761,6 +821,9 @@ pub struct MessageReceiveEvent {
 #[derive(Debug, Deserialize)]
 pub struct Sender {
     pub sender_id: SenderId,
+    /// `user`, or `app` or `bot` for a bot's message.
+    #[serde(default)]
+    pub sender_type: String,
 }
 
 /// Someone a message mentions: `key` is what stands for them in its text
@@ -895,6 +958,19 @@ mod tests {
             ]),
             "https://open.feishu.cn/open-apis/im/v1/messages/om_1%2F..%2Fx%3Fy%23z/resources/f%20k"
         );
+    }
+
+    #[test]
+    fn a_reply_to_a_message_that_is_gone_is_told_apart() {
+        let refused = |code: i64| {
+            anyhow::Error::from(Refused {
+                code,
+                msg: String::new(),
+            })
+        };
+        assert!(gone(&refused(230_011)) && gone(&refused(230_019)));
+        assert!(!gone(&refused(230_099)), "a card Lark refuses is not");
+        assert!(!gone(&anyhow::anyhow!("no answer")));
     }
 
     #[test]

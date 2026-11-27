@@ -41,6 +41,10 @@ cbc = "0.1"
 sha2 = "0.10"
 base64 = "0.22"
 
+[dev-dependencies]
+# A paused clock, for the reactions' timing.
+tokio = { version = "1.52", features = ["test-util"] }
+
 [lints.rust]
 unsafe_code = "forbid"
 

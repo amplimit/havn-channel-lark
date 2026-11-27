@@ -596,6 +596,7 @@ impl Chats {
     /// frame it has not taken yet.
     fn writing(&self, w: types::ChannelWriting) {
         REPLY_IDS.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.out.working.being_written(&w.to);
         let mut map = inboxes(&self.inboxes);
         let inbox = map.entry(w.to.clone()).or_insert_with(|| {
             let inbox = Arc::new(Inbox::default());
@@ -625,7 +626,13 @@ pub(crate) fn recipient(to: &str) -> Option<(&'static str, String)> {
     } else if id.starts_with("oc_") {
         "chat_id"
     } else if id.starts_with("omt_") {
-        return group::thread(id).map(|t| (lark::THREAD, t.anchor));
+        return group::thread(id).map(|t| {
+            if t.gone {
+                ("chat_id", t.chat)
+            } else {
+                (lark::THREAD, t.anchor)
+            }
+        });
     } else {
         return None;
     };
@@ -940,6 +947,10 @@ mod tests {
         group::note_thread("omt_r1", "oc_1", "om_first");
         assert_eq!(recipient("lark:omt_r1"), to(lark::THREAD, "om_first"));
         assert_eq!(recipient("lark:omt_other"), None);
+        // One whose first message is gone: its group.
+        group::note_thread("omt_r2", "oc_2", "om_first2");
+        let _ = group::thread_gone("om_first2");
+        assert_eq!(recipient("lark:omt_r2"), to("chat_id", "oc_2"));
         assert_eq!(recipient("lark:x"), None);
         assert_eq!(recipient("tg:1"), None);
         // A reply to an item of the bot's menu, which is no message, goes
