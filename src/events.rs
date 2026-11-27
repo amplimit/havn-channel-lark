@@ -294,17 +294,20 @@ async fn chat_worker(incoming: Incoming, chat: String, mut rx: mpsc::Receiver<Ar
 }
 
 /// `payload` without what is not the agent's to see: the app's
-/// Verification Token and the tenant's key.
+/// Verification Token, the tenant's key, and a press's token.
 fn without_secrets(mut payload: Value) -> Value {
     if let Some(header) = payload.get_mut("header").and_then(Value::as_object_mut) {
         header.remove("token");
         header.remove("tenant_key");
     }
-    if let Some(sender) = payload
-        .pointer_mut("/event/sender")
-        .and_then(Value::as_object_mut)
-    {
-        sender.remove("tenant_key");
+    for who in ["/event/sender", "/event/operator"] {
+        if let Some(who) = payload.pointer_mut(who).and_then(Value::as_object_mut) {
+            who.remove("tenant_key");
+        }
+    }
+    // A press's token, which updates its card.
+    if let Some(event) = payload.get_mut("event").and_then(Value::as_object_mut) {
+        event.remove("token");
     }
     payload
 }
@@ -1332,6 +1335,11 @@ mod tests {
         assert_eq!(inb.sender_id, "lark:on_ou_a");
         assert_eq!(inb.sender_aliases, ["lark:ou_a"]);
         assert_eq!(inb.channel_message_id, "om_card");
+        let raw = inb.raw.as_ref().unwrap();
+        assert!(
+            raw["event"].get("token").is_none()
+                && raw["event"]["operator"].get("tenant_key").is_none()
+        );
         assert_eq!(
             inb.content,
             ChannelMessageContent::Text {
