@@ -11,7 +11,9 @@
 //!   Token and tenant key, its files first given to the gateway;
 //! - takes a press on one of the bot's cards (`card.action.trigger`) and
 //!   an item of the bot's menu (`application.bot.menu_v6`) as what the
-//!   person typed, answering a press with the card without its buttons.
+//!   person typed, answering a press with the card without its buttons;
+//! - passes a group's message on with its group ([`crate::group`]), and
+//!   notes the bot being added to a group or removed from one.
 //!
 //! The webhook also answers the one-time `url_verification` challenge and,
 //! with an Encrypt Key, refuses a request whose signature does not match or
@@ -43,11 +45,13 @@ use tracing::{debug, info, warn};
 
 use crate::card;
 use crate::gateway::Gateway;
+use crate::group::{self, Place};
 use crate::havn_ws::Delivered;
 use crate::lark::{
-    CardAction, EventEnvelope, LarkClient, MenuEvent, MessageReceiveEvent, SenderId,
+    CardAction, ChatEvent, EventEnvelope, LarkClient, Mention, MenuEvent, MessageReceiveEvent,
+    SenderId,
 };
-use crate::types::{Attachment, ChannelFrame, ChannelInbound, ChannelMessageContent};
+use crate::types::{Attachment, ChannelFrame, ChannelGroup, ChannelInbound, ChannelMessageContent};
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
 
@@ -78,13 +82,15 @@ pub enum Arrival {
     /// A message a sender sent.
     Message(Box<MessageReceiveEvent>, Value),
     /// What a press or the bot's menu sends, as if the person typed it;
-    /// `react_on`, the card pressed, shows that its reply is due.
+    /// `react_on`, the card pressed, shows that its reply is due. A press in
+    /// a group is in its `place` there.
     Said {
         ids: SenderId,
         message_id: String,
         text: String,
         raw: Value,
         react_on: Option<String>,
+        place: Option<Place>,
     },
 }
 
@@ -253,6 +259,14 @@ impl Incoming {
         }
         match env.header.event_type.as_str() {
             "im.message.receive_v1" => {}
+            "im.chat.member.bot.added_v1" => {
+                self.chat_event(env.event, true);
+                return Taken::Done;
+            }
+            "im.chat.member.bot.deleted_v1" | "im.chat.disbanded_v1" => {
+                self.chat_event(env.event, false);
+                return Taken::Done;
+            }
             "card.action.trigger" => {
                 return Taken::Answer(self.press(env.event, without_secrets(payload)));
             }
@@ -277,9 +291,32 @@ impl Incoming {
             debug!(message_id = %ev.message.message_id, "lark: a message taken before; dropping");
             return Taken::Done;
         }
+        // Another bot's, or the bot's own: not a person's to answer.
+        if !ev.sender.sender_type.is_empty() && ev.sender.sender_type != "user" {
+            debug!(sender_type = %ev.sender.sender_type, "lark: a message of a bot; dropping");
+            return Taken::Done;
+        }
         // Translate + forward off the answer's path (Lark wants it within
-        // 3s; STT/download can take longer), in the chat's order.
-        let chat = ev.message.chat_id.clone();
+        // 3s; STT/download can take longer), in the order of its chat, or
+        // of its conversation in a group: the group or its thread.
+        let mut chat = ev.message.chat_id.clone();
+        if ev.message.chat_type == "group" {
+            let thread = ev.message.thread_id.as_deref().filter(|t| !t.is_empty());
+            if let Some(thread) = thread {
+                let anchor = ev
+                    .message
+                    .root_id
+                    .as_deref()
+                    .filter(|r| !r.is_empty())
+                    .unwrap_or(&ev.message.message_id);
+                group::note_thread(thread, &chat, anchor);
+            }
+            chat = Place {
+                chat,
+                thread: thread.map(String::from),
+            }
+            .conversation();
+        }
         if ev.message.chat_type == "p2p" {
             let (sender, aliases) = sender_ids(&ev.sender.sender_id);
             let mut ids = aliases;
@@ -291,6 +328,26 @@ impl Incoming {
             Arrival::Message(Box::new(ev), without_secrets(payload)),
         );
         Taken::Done
+    }
+
+    /// The bot was added to a group (`added`), or removed from one, or the
+    /// group was disbanded.
+    fn chat_event(&self, event: Value, added: bool) {
+        let ev: ChatEvent = match serde_json::from_value(event) {
+            Ok(ev) => ev,
+            Err(e) => {
+                warn!(error = %e, "lark: malformed event of a group");
+                return;
+            }
+        };
+        if added {
+            group::added(&ev.chat_id, ev.name);
+            // Permissions given since are granted with the app's new version.
+            let lark = Arc::clone(&self.lark);
+            tokio::spawn(async move { group::learn_scopes(&lark).await });
+        } else {
+            group::removed(&ev.chat_id);
+        }
     }
 
     fn people(&self) -> std::sync::MutexGuard<'_, People> {
@@ -540,7 +597,9 @@ impl Incoming {
     /// sends goes on as the person who pressed it typed it, once, and Lark
     /// is answered with the card without its buttons. Only the person the
     /// card was sent to may press it: one forwarded to someone else is not
-    /// theirs.
+    /// theirs. A card sent to a group may be pressed by anyone there, in
+    /// that group only: the press goes on as their message in the card's
+    /// conversation, and the gateway decides what they may do.
     fn press(&self, event: Value, raw: Value) -> Value {
         let ev: CardAction = match serde_json::from_value(event) {
             Ok(ev) => ev,
@@ -555,14 +614,10 @@ impl Incoming {
             union_id: ev.operator.union_id.clone(),
         };
         let (sender, aliases) = sender_ids(&ids);
-        let to = value
-            .get(card::TO)
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if to != sender && !aliases.iter().any(|a| a == to) {
-            warn!(message = %ev.context.open_message_id, "lark: a card pressed by someone it was not sent to");
-            return toast("error", "This is not yours to answer.");
-        }
+        let place = match pressed_where(&ev, &sender, &aliases) {
+            Ok(place) => place,
+            Err(answer) => return answer,
+        };
         let said = match said_of(value, &ev.action.form_value) {
             Ok(said) => said,
             Err(answer) => return answer,
@@ -571,6 +626,12 @@ impl Incoming {
         let mut ids_of_sender = aliases;
         ids_of_sender.push(sender.clone());
         let private = self.people().chat_of(&ids_of_sender);
+        // Where the press waits its turn: the card's conversation in a
+        // group, else the person's private chat.
+        let chat = match &place {
+            Some(place) => place.conversation(),
+            None => private.clone().unwrap_or_else(|| sender.clone()),
+        };
         // A reply's Stop button (havn issue #325): `/stop` from the person,
         // in their chat, while the reply is written; a person's presses
         // within 5 seconds count once. The button stays until the reply ends.
@@ -580,13 +641,14 @@ impl Incoming {
             crate::live::Pressed::Spent => return toast("info", "This reply has ended."),
             crate::live::Pressed::Stop(_) => {
                 let queued = self.to_chat(
-                    private.unwrap_or_else(|| sender.clone()),
+                    chat,
                     Arrival::Said {
                         ids,
                         message_id: format!("{PRESS_PREFIX}{message_id}"),
                         text: "/stop".into(),
                         raw,
                         react_on: None,
+                        place,
                     },
                 );
                 if !queued {
@@ -610,12 +672,10 @@ impl Incoming {
         let ours = cards.knows(&message_id);
         let in_private =
             private.is_some() && private.as_deref() == Some(ev.context.open_chat_id.as_str());
-        if !ours && !in_private {
+        if place.is_none() && !ours && !in_private {
             warn!(message = %message_id, "lark: a card pressed outside the person's private chat with the bot");
             return toast("error", "Press it in your chat with the bot.");
         }
-        // The person's private chat, where their messages wait in turn.
-        let chat = private.unwrap_or_else(|| sender.clone());
         let queued = self.to_chat(
             chat,
             Arrival::Said {
@@ -624,6 +684,7 @@ impl Incoming {
                 text: said,
                 raw,
                 react_on: Some(message_id.clone()),
+                place,
             },
         );
         if !queued {
@@ -674,8 +735,45 @@ impl Incoming {
                 text,
                 raw,
                 react_on: None,
+                place: None,
             },
         );
+    }
+}
+
+/// Where press `ev` by `sender` (who went by `aliases`) goes: in the group
+/// its card was sent to (`Some`), when pressed there; to the person, when
+/// the card was sent to them; else what Lark is answered with.
+fn pressed_where(
+    ev: &CardAction,
+    sender: &str,
+    aliases: &[String],
+) -> Result<Option<Place>, Value> {
+    let to = ev
+        .action
+        .value
+        .get(card::TO)
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !group::in_group(to) {
+        if to != sender && !aliases.iter().any(|a| a == to) {
+            warn!(message = %ev.context.open_message_id, "lark: a card pressed by someone it was not sent to");
+            return Err(toast("error", "This is not yours to answer."));
+        }
+        return Ok(None);
+    }
+    match Place::of_to(to) {
+        Some(place) if place.chat == ev.context.open_chat_id => {
+            if group::gateway_takes_groups() {
+                Ok(Some(place))
+            } else {
+                Err(toast("info", "This bot is not used in groups yet."))
+            }
+        }
+        _ => {
+            warn!(message = %ev.context.open_message_id, "lark: a group's card pressed outside its group");
+            Err(toast("error", "This is not yours to answer."))
+        }
     }
 }
 
@@ -718,49 +816,17 @@ fn toast(kind: &str, content: &str) -> Value {
 }
 
 /// Translate one arrival into a havn `ChannelInbound` and send it over the
-/// WS. 1:1 (`p2p`) chats only.
+/// WS: a private chat's, or a group's to a gateway that takes them, with its
+/// group and whether it is to the bot. A group message not to the bot goes as
+/// its text, or a line saying what it was, without its files; one to the bot
+/// shows that its reply is due.
 async fn translate_and_forward(incoming: Incoming, arrival: Arrival) {
-    let (ids, message_id, content, attachments, raw, timestamp) = match arrival {
+    let (ids, message_id, content, attachments, raw, timestamp, group) = match arrival {
         Arrival::Message(ev, raw) => {
-            let m = &ev.message;
-            if m.chat_type != "p2p" {
-                debug!(chat_type = %m.chat_type, chat_id = %m.chat_id, "dropping non-p2p message (1:1 chats only)");
-                return;
-            }
-            let (sender, aliases) = incoming.ids(&ev.sender.sender_id);
-            let mut attachments = Vec::new();
-            let Some(content) = build_content(
-                &incoming,
-                ev_message_payload(m),
-                m,
-                (&sender, &aliases),
-                &mut attachments,
-            )
-            .await
-            else {
+            let Some(translated) = translate_message(&incoming, *ev, raw).await else {
                 return;
             };
-            // A typed /stop gets no reply of its own.
-            if !matches!(&content, ChannelMessageContent::Text { text } if crate::live::is_stop(text))
-            {
-                incoming
-                    .working
-                    .start(&sender, &m.message_id, &m.message_id);
-            }
-            let timestamp = m
-                .create_time
-                .as_deref()
-                .and_then(|s| s.parse::<i64>().ok())
-                .and_then(chrono::DateTime::from_timestamp_millis)
-                .unwrap_or_else(chrono::Utc::now);
-            (
-                ev.sender.sender_id,
-                m.message_id.clone(),
-                content,
-                attachments,
-                raw,
-                timestamp,
-            )
+            translated
         }
         Arrival::Said {
             ids,
@@ -768,10 +834,17 @@ async fn translate_and_forward(incoming: Incoming, arrival: Arrival) {
             text,
             raw,
             react_on,
+            place,
         } => {
+            let group = match &place {
+                Some(place) => Some(place.group(&incoming.lark, &ids.open_id, true).await),
+                None => None,
+            };
             if let Some(react_on) = react_on {
-                let (sender, _) = incoming.ids(&ids);
-                incoming.working.start(&sender, &react_on, &message_id);
+                let to = place
+                    .as_ref()
+                    .map_or_else(|| incoming.ids(&ids).0, Place::conversation);
+                incoming.working.start(&to, &react_on, &message_id);
             }
             (
                 ids,
@@ -780,6 +853,7 @@ async fn translate_and_forward(incoming: Incoming, arrival: Arrival) {
                 Vec::new(),
                 raw,
                 chrono::Utc::now(),
+                group,
             )
         }
     };
@@ -795,6 +869,7 @@ async fn translate_and_forward(incoming: Incoming, arrival: Arrival) {
         raw: Some(raw),
         sender_aliases,
         attachments,
+        group,
     };
     if incoming
         .outbound_tx
@@ -804,6 +879,178 @@ async fn translate_and_forward(incoming: Incoming, arrival: Arrival) {
     {
         warn!("lark: havn outbound channel closed; inbound dropped");
     }
+}
+
+/// A message as it goes to the gateway: its sender, its id, what it says,
+/// its files, Lark's event, when it was sent, and its group.
+type Translated = (
+    SenderId,
+    String,
+    ChannelMessageContent,
+    Vec<Attachment>,
+    Value,
+    chrono::DateTime<chrono::Utc>,
+    Option<ChannelGroup>,
+);
+
+/// Message `ev` (Lark's event `raw`) as it goes to the gateway; none when it
+/// does not go on.
+async fn translate_message(
+    incoming: &Incoming,
+    ev: MessageReceiveEvent,
+    raw: Value,
+) -> Option<Translated> {
+    let m = &ev.message;
+    let place = match m.chat_type.as_str() {
+        "p2p" => None,
+        "group" if group::gateway_takes_groups() => Some(Place {
+            chat: m.chat_id.clone(),
+            thread: m.thread_id.clone().filter(|t| !t.is_empty()),
+        }),
+        "group" => {
+            debug!(chat_id = %m.chat_id, "dropping a group message: the gateway has not said it takes them");
+            return None;
+        }
+        other => {
+            debug!(chat_type = %other, chat_id = %m.chat_id, "dropping a message of another kind of chat");
+            return None;
+        }
+    };
+    let (sender, aliases) = incoming.ids(&ev.sender.sender_id);
+    let payload = ev_message_payload(m);
+    let (said, mentioned) = written_of(m, &payload);
+    let group = match &place {
+        Some(place) => {
+            // Only a bot that gets every message gets one that mentions
+            // neither it (known once Lark said who the bot is) nor everyone.
+            if !mentioned && !mentions_everyone(m, &payload) && group::bot().is_some() {
+                group::saw_all();
+            }
+            let addressed = mentioned
+                || said.as_deref().is_some_and(group::is_command)
+                || replies_to_bot(&incoming.lark, m).await;
+            Some(
+                place
+                    .group(&incoming.lark, &ev.sender.sender_id.open_id, addressed)
+                    .await,
+            )
+        }
+        None => None,
+    };
+    let addressed = group.as_ref().is_none_or(|g| g.addressed);
+    let mut attachments = Vec::new();
+    let content = if addressed {
+        build_content(
+            incoming,
+            payload,
+            m,
+            said,
+            (&sender, &aliases, group.as_ref()),
+            &mut attachments,
+        )
+        .await
+    } else {
+        described(m, &payload, said)
+    };
+    let content = content?;
+    // A typed /stop gets no reply of its own, nor does a group's
+    // message not to the bot.
+    let stop =
+        matches!(&content, ChannelMessageContent::Text { text } if crate::live::is_stop(text));
+    if addressed && !stop {
+        let to = place
+            .as_ref()
+            .map_or_else(|| sender.clone(), Place::conversation);
+        incoming.working.start(&to, &m.message_id, &m.message_id);
+    }
+    let timestamp = m
+        .create_time
+        .as_deref()
+        .and_then(|s| s.parse::<i64>().ok())
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .unwrap_or_else(chrono::Utc::now);
+    Some((
+        ev.sender.sender_id.clone(),
+        m.message_id.clone(),
+        content,
+        attachments,
+        raw,
+        timestamp,
+        group,
+    ))
+}
+
+/// Whether group message `m` replies to one of the bot's messages.
+async fn replies_to_bot(lark: &LarkClient, m: &crate::lark::LarkMessage) -> bool {
+    match m.parent_id.as_deref().filter(|p| !p.is_empty()) {
+        Some(parent) => group::is_ours(lark, parent).await,
+        None => false,
+    }
+}
+
+/// The text of message `m` (`payload` its content), when it is text or rich
+/// text, as the agent reads it, and whether it mentions the bot.
+fn written_of(m: &crate::lark::LarkMessage, payload: &Value) -> (Option<String>, bool) {
+    let bot = group::bot();
+    let mentioned = m.mentions.iter().any(|x| group::is_bot(x, bot));
+    let said = match m.message_type.as_str() {
+        "text" => payload
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|t| group::written(t, &m.mentions, bot).0),
+        "post" => Some(flatten_post(payload, &m.mentions, bot)),
+        _ => None,
+    };
+    (said, mentioned)
+}
+
+/// Whether message `m` (`payload` its content) mentions everyone: a bot
+/// that gets only mentions may get it.
+fn mentions_everyone(m: &crate::lark::LarkMessage, payload: &Value) -> bool {
+    let all = |key: &str| key == "@_all" || key == "all";
+    if m.mentions.iter().any(|x| all(&x.key)) {
+        return true;
+    }
+    match m.message_type.as_str() {
+        "text" => payload
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.contains("@_all")),
+        "post" => payload
+            .as_object()
+            .into_iter()
+            .flat_map(|langs| langs.values())
+            .filter_map(|lang| lang.get("content").and_then(Value::as_array))
+            .flatten()
+            .filter_map(Value::as_array)
+            .flatten()
+            .any(|el| {
+                el.get("tag").and_then(Value::as_str) == Some("at")
+                    && el.get("user_id").and_then(Value::as_str).is_some_and(all)
+            }),
+        _ => false,
+    }
+}
+
+/// A group's message not to the bot, as it is kept for context: its text, or
+/// a line saying what it was; its files are not fetched.
+fn described(
+    m: &crate::lark::LarkMessage,
+    payload: &Value,
+    said: Option<String>,
+) -> Option<ChannelMessageContent> {
+    let name = payload.get("file_name").and_then(Value::as_str);
+    let text = match m.message_type.as_str() {
+        "text" | "post" => said?,
+        "image" => "[an image]".to_string(),
+        "file" => format!("[a file: {}]", name.unwrap_or("file")),
+        "audio" => "[a voice message]".to_string(),
+        "media" => format!("[a video: {}]", name.unwrap_or("video")),
+        "sticker" => "[a sticker]".to_string(),
+        "location" => "[a location]".to_string(),
+        _ => return None,
+    };
+    Some(ChannelMessageContent::Text { text })
 }
 
 /// Parse the `content` JSON string of a message, returning the inner object.
@@ -817,25 +1064,20 @@ fn ev_message_payload(m: &crate::lark::LarkMessage) -> Value {
 /// (havn issue #106), which keeps it in the agent's inbox and transcribes a
 /// voice message when it is set up to (havn issue #164); the message names
 /// it, or says it could not be received. A sticker, which Lark lets no bot
-/// download, is a line saying so.
+/// download, is a line saying so. `said` is the text of a text or rich text
+/// message, as [`written_of`] gave it; a file of a group's message is given
+/// for its group.
 async fn build_content(
     incoming: &Incoming,
     content: Value,
     m: &crate::lark::LarkMessage,
-    sender: (&str, &[String]),
+    said: Option<String>,
+    sender: (&str, &[String], Option<&ChannelGroup>),
     attachments: &mut Vec<Attachment>,
 ) -> Option<ChannelMessageContent> {
     let key = |name: &str| content.get(name).and_then(Value::as_str).map(String::from);
     match m.message_type.as_str() {
-        "text" => {
-            let text = content.get("text").and_then(Value::as_str)?.to_string();
-            Some(ChannelMessageContent::Text { text })
-        }
-        "post" => {
-            // Rich text: flatten to the plain text we can extract.
-            let text = flatten_post(&content);
-            Some(ChannelMessageContent::Text { text })
-        }
+        "text" | "post" => Some(ChannelMessageContent::Text { text: said? }),
         "location" => {
             let lat = content.get("latitude").and_then(parse_coord)?;
             let lon = content.get("longitude").and_then(parse_coord)?;
@@ -902,7 +1144,7 @@ async fn receive(
     m: &crate::lark::LarkMessage,
     key: &str,
     kind: &str,
-    (sender, aliases): (&str, &[String]),
+    (sender, aliases, group): (&str, &[String], Option<&ChannelGroup>),
     name: Option<&str>,
 ) -> Result<Attachment> {
     let resource = if kind == "image" { "image" } else { "file" };
@@ -930,7 +1172,7 @@ async fn receive(
     };
     incoming
         .gateway
-        .upload(sender, aliases, &name, &media_type, bytes)
+        .upload(sender, aliases, group, &name, &media_type, bytes)
         .await
 }
 
@@ -1007,11 +1249,21 @@ fn failure(e: &anyhow::Error) -> &'static str {
 /// answers which message, so a chat's messages are answered in turn, the
 /// oldest first; a part of a reply with more to come leaves it on. One that
 /// gets no reply goes after [`WORKING_FOR`].
+///
+/// A gateway that shows replies as they are written says every minute that
+/// one is: a message whose conversation heard none of that for
+/// [`QUIET_FOR`] gets no reply of the agent's (the gateway turned it away
+/// without naming it, or answered a command as `/new` without), and loses
+/// its reaction.
 #[derive(Clone)]
 pub struct Working {
     lark: Arc<LarkClient>,
     chats: Arc<Mutex<HashMap<String, VecDeque<Shown>>>>,
     next: Arc<AtomicU64>,
+    /// When each conversation last heard that a reply is being written.
+    written: Arc<Mutex<HashMap<String, std::time::Instant>>>,
+    /// The gateway shows replies as they are written.
+    writing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A message with the reaction on, or being put on.
@@ -1026,6 +1278,13 @@ struct Shown {
 
 const WORKING_EMOJI: &str = "Typing";
 const WORKING_FOR: std::time::Duration = std::time::Duration::from_mins(5);
+/// How often a message's reaction is looked at, and how long its
+/// conversation may hear nothing being written: the gateway says it every
+/// minute while a reply is.
+const QUIET_EVERY: std::time::Duration = std::time::Duration::from_secs(45);
+const QUIET_FOR: std::time::Duration = std::time::Duration::from_secs(120);
+/// Conversations whose last writing is kept at most.
+const WRITTEN_KEPT: usize = 4096;
 
 impl Working {
     pub fn new(lark: Arc<LarkClient>) -> Self {
@@ -1033,7 +1292,41 @@ impl Working {
             lark,
             chats: Arc::default(),
             next: Arc::new(AtomicU64::new(0)),
+            written: Arc::default(),
+            writing: Arc::default(),
         }
+    }
+
+    /// A reply is being written to `to`: its messages' reactions stay.
+    pub fn being_written(&self, to: &str) {
+        self.writing.store(true, Ordering::Relaxed);
+        let mut written = self
+            .written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if written.len() >= WRITTEN_KEPT && !written.contains_key(to) {
+            written.retain(|_, at| at.elapsed() < QUIET_FOR);
+        }
+        written.insert(to.to_string(), std::time::Instant::now());
+    }
+
+    /// Whether `to` heard that a reply is being written in the last
+    /// [`QUIET_FOR`], or the gateway does not say it.
+    fn heard(&self, to: &str) -> bool {
+        !self.writing.load(Ordering::Relaxed)
+            || self
+                .written
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(to)
+                .is_some_and(|at| at.elapsed() < QUIET_FOR)
+    }
+
+    /// Whether message `id` of `to` still shows its reaction.
+    fn shows(&self, to: &str, id: u64) -> bool {
+        self.chats()
+            .get(to)
+            .is_some_and(|q| q.iter().any(|s| s.id == id))
     }
 
     fn chats(&self) -> std::sync::MutexGuard<'_, HashMap<String, VecDeque<Shown>>> {
@@ -1082,8 +1375,17 @@ impl Working {
                     debug!(error = %format!("{e:#}"), "lark: could not show that a reply is due");
                 }
             }
-            tokio::time::sleep(WORKING_FOR).await;
-            this.end(&to, |s| s.id == id);
+            let until = tokio::time::Instant::now() + WORKING_FOR;
+            loop {
+                tokio::time::sleep(QUIET_EVERY).await;
+                if !this.shows(&to, id) {
+                    return;
+                }
+                if tokio::time::Instant::now() >= until || !this.heard(&to) {
+                    this.end(&to, |s| s.id == id);
+                    return;
+                }
+            }
         });
     }
 
@@ -1141,8 +1443,9 @@ impl Working {
     }
 }
 
-/// Extract plain text from a Lark `post` (rich text) content object.
-fn flatten_post(content: &Value) -> String {
+/// Extract plain text from a Lark `post` (rich text) content object, its
+/// mentions as [`group::written`] writes them.
+fn flatten_post(content: &Value, mentions: &[Mention], bot: Option<&str>) -> String {
     // Shape: { "<lang>": { "title": "...", "content": [[ {tag,text/...}, ... ], ...] } }
     let mut out = String::new();
     // First language block only.
@@ -1157,13 +1460,11 @@ fn flatten_post(content: &Value) -> String {
             for line in lines {
                 if let Some(elems) = line.as_array() {
                     for el in elems {
-                        // `text`/`a` carry their text in `text`; `at` mentions
-                        // carry the display name in `user_name`.
-                        if let Some(t) = el
-                            .get("text")
-                            .or_else(|| el.get("user_name"))
-                            .and_then(Value::as_str)
-                        {
+                        // `text`/`a` carry their text in `text`; an `at`
+                        // names who it mentions by the key of its mention.
+                        if el.get("tag").and_then(Value::as_str) == Some("at") {
+                            out.push_str(&post_mention(el, mentions, bot));
+                        } else if let Some(t) = el.get("text").and_then(Value::as_str) {
                             out.push_str(t);
                         }
                     }
@@ -1173,6 +1474,29 @@ fn flatten_post(content: &Value) -> String {
         }
     }
     out.trim().to_string()
+}
+
+/// A rich text's mention `el`: none of the bot, `@all` of everyone, else `@`
+/// and the name.
+fn post_mention(el: &Value, mentions: &[Mention], bot: Option<&str>) -> String {
+    let key = el
+        .get("user_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if key == "all" || key == "@_all" {
+        return "@all".to_string();
+    }
+    let mention = mentions.iter().find(|m| m.key == key);
+    if mention.is_some_and(|m| group::is_bot(m, bot)) {
+        return String::new();
+    }
+    let name = el
+        .get("user_name")
+        .and_then(Value::as_str)
+        .filter(|n| !n.is_empty())
+        .or_else(|| mention.map(|m| m.name.as_str()).filter(|n| !n.is_empty()))
+        .unwrap_or("someone");
+    format!("@{}", name.trim_start_matches('@'))
 }
 
 fn parse_coord(v: &Value) -> Option<f64> {
@@ -1193,16 +1517,26 @@ mod tests {
             r#"{"en_us":{"title":"Hi","content":[[{"tag":"text","text":"hello "},{"tag":"text","text":"world"}]]}}"#,
         )
         .unwrap();
-        assert_eq!(flatten_post(&v), "Hi\nhello world");
+        assert_eq!(flatten_post(&v, &[], None), "Hi\nhello world");
     }
 
     #[test]
     fn flatten_post_includes_mentions() {
         let v: Value = serde_json::from_str(
-            r#"{"en_us":{"content":[[{"tag":"at","user_id":"ou_x","user_name":"@alice"},{"tag":"text","text":" hi"}]]}}"#,
+            r#"{"en_us":{"content":[[{"tag":"at","user_id":"@_user_1","user_name":"Acme"},
+                {"tag":"text","text":" ask "},{"tag":"at","user_id":"@_user_2","user_name":"@alice"},
+                {"tag":"text","text":" and "},{"tag":"at","user_id":"all","user_name":"Everyone"}]]}}"#,
         )
         .unwrap();
-        assert_eq!(flatten_post(&v), "@alice hi");
+        let mentions: Vec<Mention> = serde_json::from_value(json!([
+            {"key": "@_user_1", "id": {"open_id": "ou_bot"}, "name": "Acme"},
+            {"key": "@_user_2", "id": {"open_id": "ou_alice"}, "name": "alice"}
+        ]))
+        .unwrap();
+        assert_eq!(
+            flatten_post(&v, &mentions, Some("ou_bot")),
+            "ask @alice and @all"
+        );
     }
 
     #[test]
@@ -1602,6 +1936,55 @@ mod tests {
         assert_eq!(working.waiting("lark:on_b"), ["om_3"]);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_reaction_comes_off_when_nothing_is_written_for_its_message() {
+        let (incoming, _rx) = incoming(None, None);
+        let working = &incoming.working;
+        working.being_written("lark:on_other");
+        working.start("lark:on_a", "om_quiet", "om_quiet");
+        working.start("lark:on_b", "om_busy", "om_busy");
+        for _ in 0..6 {
+            working.being_written("lark:on_b");
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+        // Nothing written for it: off; its reply being written: on.
+        assert_eq!(working.waiting("lark:on_a"), Vec::<String>::new());
+        assert_eq!(working.waiting("lark:on_b"), ["om_busy"]);
+        // Past WORKING_FOR, off whatever is written.
+        for _ in 0..8 {
+            working.being_written("lark:on_b");
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+        assert_eq!(working.waiting("lark:on_b"), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_bot_s_message_is_not_passed_on() {
+        let (incoming, mut rx) = incoming(None, None);
+        let mut event = message_event("b1", "om_b1", "");
+        event["event"]["sender"]["sender_type"] = json!("app");
+        assert_eq!(incoming.take(event), Taken::Done);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_mention_of_everyone_is_told_apart() {
+        let message = |kind: &str, content: Value| -> crate::lark::LarkMessage {
+            serde_json::from_value(json!({
+                "message_id": "om_1", "chat_id": "oc_1", "chat_type": "group",
+                "message_type": kind, "content": content.to_string()
+            }))
+            .unwrap()
+        };
+        let text = json!({"text": "@_all lunch"});
+        assert!(mentions_everyone(&message("text", text.clone()), &text));
+        let text = json!({"text": "lunch"});
+        assert!(!mentions_everyone(&message("text", text.clone()), &text));
+        let post = json!({"zh_cn": {"content": [[{"tag": "at", "user_id": "all"}]]}});
+        assert!(mentions_everyone(&message("post", post.clone()), &post));
+    }
+
     #[test]
     fn images_are_told_by_their_bytes() {
         assert_eq!(
@@ -1678,5 +2061,171 @@ mod tests {
         let (incoming, mut rx) = self::incoming(None, None);
         assert_eq!(incoming.take(message_event("e1", "om_1", "")), Taken::Done);
         assert!(matches!(rx.recv().await, Some(ChannelFrame::Inbound(_))));
+    }
+
+    /// A message of `open_id` in group `chat` (in `thread`), saying `text`
+    /// with `mentions`.
+    fn group_event(
+        event_id: &str,
+        message_id: &str,
+        (chat, thread): (&str, Option<&str>),
+        text: &str,
+        mentions: Value,
+    ) -> Value {
+        let mut event = message_event(event_id, message_id, "");
+        let message = &mut event["event"]["message"];
+        message["chat_id"] = json!(chat);
+        message["chat_type"] = json!("group");
+        message["content"] = json!(json!({ "text": text }).to_string());
+        message["mentions"] = mentions;
+        if let Some(thread) = thread {
+            message["thread_id"] = json!(thread);
+            message["root_id"] = json!("om_root");
+        }
+        event
+    }
+
+    fn groups_on() {
+        group::know_bot("ou_bot");
+        group::gateway_said(true, ["new".to_string(), "stop".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_group_message_that_mentions_the_bot_is_to_it() {
+        groups_on();
+        let (incoming, mut rx) = incoming(None, None);
+        let mentions = json!([
+            {"key": "@_user_1", "id": {"open_id": "ou_bot"}, "name": "Acme", "mentioned_type": "bot"},
+            {"key": "@_user_2", "id": {"open_id": "ou_ann", "union_id": "on_ann"}, "name": "Ann"}
+        ]);
+        let event = group_event(
+            "g1",
+            "om_g1",
+            ("oc_team", None),
+            "@_user_1 ask @_user_2 about <at id=all></at>",
+            mentions,
+        );
+        assert_eq!(incoming.take(event), Taken::Done);
+        let inb = said(&mut rx).await;
+        assert_eq!(
+            inb.content,
+            ChannelMessageContent::Text {
+                text: "ask @Ann about <at id=all></at>".into()
+            }
+        );
+        let g = inb.group.unwrap();
+        assert_eq!(g.id, "lark:oc_team");
+        assert!(g.addressed);
+        assert_eq!(g.thread, None);
+        // Its reply is due in the group.
+        assert_eq!(incoming.working.waiting("lark:oc_team"), ["om_g1"]);
+        assert_eq!(incoming.working.waiting("lark:on_b"), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_group_message_not_to_the_bot_goes_on_for_context_only() {
+        groups_on();
+        let (incoming, mut rx) = incoming(None, None);
+        let event = group_event("g2", "om_g2", ("oc_team", None), "lunch?", json!([]));
+        assert_eq!(incoming.take(event), Taken::Done);
+        let inb = said(&mut rx).await;
+        assert!(!inb.group.as_ref().unwrap().addressed);
+        // Only a bot that gets every message gets one that does not mention it.
+        assert_eq!(inb.group.unwrap().sees_all, Some(true));
+        // An image not to the bot is a line: its file is not fetched.
+        let mut image = group_event("g3", "om_g3", ("oc_team", None), "", json!([]));
+        image["event"]["message"]["message_type"] = json!("image");
+        image["event"]["message"]["content"] = json!(json!({"image_key": "img_1"}).to_string());
+        assert_eq!(incoming.take(image), Taken::Done);
+        let inb = said(&mut rx).await;
+        assert_eq!(
+            inb.content,
+            ChannelMessageContent::Text {
+                text: "[an image]".into()
+            }
+        );
+        assert_eq!(inb.attachments, Vec::new());
+        // A command is to the bot without a mention.
+        let event = group_event("g4", "om_g4", ("oc_team", None), "/new", json!([]));
+        assert_eq!(incoming.take(event), Taken::Done);
+        assert!(said(&mut rx).await.group.unwrap().addressed);
+        // Neither gets a reaction but the command.
+        assert_eq!(incoming.working.waiting("lark:oc_team"), ["om_g4"]);
+    }
+
+    #[tokio::test]
+    async fn a_thread_is_a_conversation_of_its_own() {
+        groups_on();
+        let (incoming, mut rx) = incoming(None, None);
+        let mentions = json!([{"key": "@_user_1", "id": {"open_id": "ou_bot"}, "name": "Acme"}]);
+        let event = group_event(
+            "t1",
+            "om_t1",
+            ("oc_topics", Some("omt_one")),
+            "@_user_1 hi",
+            mentions,
+        );
+        assert_eq!(incoming.take(event), Taken::Done);
+        let inb = said(&mut rx).await;
+        let g = inb.group.unwrap();
+        assert_eq!(g.id, "lark:oc_topics");
+        assert_eq!(g.thread.map(|t| t.id), Some("lark:omt_one".into()));
+        // What goes to it replies to its first message.
+        assert_eq!(
+            group::thread("omt_one").map(|t| (t.chat, t.anchor)),
+            Some(("oc_topics".into(), "om_root".into()))
+        );
+        assert_eq!(incoming.working.waiting("lark:omt_one"), ["om_t1"]);
+    }
+
+    #[tokio::test]
+    async fn a_group_s_card_is_pressed_by_anyone_there_and_nowhere_else() {
+        groups_on();
+        let (incoming, mut rx) = incoming(None, None);
+        let value = json!({ "said": "/answer q2 1", "to": "lark:oc_crew" });
+        // Pressed in another chat: refused.
+        let mut elsewhere = press_event("gp0", "ou_x", value.clone(), json!({}));
+        elsewhere["event"]["context"]["open_chat_id"] = json!("oc_other");
+        let Taken::Answer(answer) = incoming.take(elsewhere) else {
+            panic!("answered");
+        };
+        assert_eq!(answer["toast"]["type"], "error");
+        // Pressed in the group by someone it was not sent to: theirs to press.
+        let mut there = press_event("gp1", "ou_x", value, json!({}));
+        there["event"]["context"]["open_chat_id"] = json!("oc_crew");
+        let Taken::Answer(_) = incoming.take(there) else {
+            panic!("answered");
+        };
+        let inb = said(&mut rx).await;
+        assert_eq!(inb.sender_id, "lark:on_ou_x");
+        let g = inb.group.unwrap();
+        assert_eq!(g.id, "lark:oc_crew");
+        assert!(g.addressed);
+        assert_eq!(incoming.working.waiting("lark:oc_crew"), ["om_card"]);
+    }
+
+    #[tokio::test]
+    async fn the_bot_removed_from_a_group_forgets_its_threads() {
+        groups_on();
+        let (incoming, _rx) = incoming(None, None);
+        group::note_thread("omt_gone", "oc_left", "om_first");
+        let event = |kind: &str| {
+            json!({
+                "schema": "2.0",
+                "header": {"event_id": format!("c-{kind}"), "event_type": kind, "token": "",
+                           "create_time": "1700000000000", "app_id": "a", "tenant_key": "t"},
+                "event": {"chat_id": "oc_left", "name": "Left", "operator_id": {"open_id": "ou_a"}}
+            })
+        };
+        assert_eq!(
+            incoming.take(event("im.chat.member.bot.added_v1")),
+            Taken::Done
+        );
+        assert!(group::thread("omt_gone").is_some());
+        assert_eq!(
+            incoming.take(event("im.chat.member.bot.deleted_v1")),
+            Taken::Done
+        );
+        assert_eq!(group::thread("omt_gone"), None);
     }
 }

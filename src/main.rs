@@ -11,10 +11,11 @@
 //! restart resumes from it. A background task keeps the
 //! `tenant_access_token` fresh.
 //!
-//! 1:1 (`p2p`) chats only. Inbound: text, rich text and locations as
-//! such; images, files, voice messages and videos downloaded and given to
-//! the gateway ([`gateway`]) as the message's attachments; a press on a
-//! card's button and an item of the bot's menu as what the person typed.
+//! Private chats (`p2p`), and groups ([`group`]) for a gateway that takes
+//! them. Inbound: text, rich text and locations as such; images, files,
+//! voice messages and videos downloaded and given to the gateway
+//! ([`gateway`]) as the message's attachments; a press on a card's button
+//! and an item of the bot's menu as what the person typed.
 //! Outbound: replies as cards ([`card`]) of the agent's Markdown, with the
 //! gateway's buttons and questions; files fetched from the gateway and sent
 //! as images or files, their captions after them; replies shown as they
@@ -27,6 +28,7 @@ mod card;
 mod config;
 mod events;
 mod gateway;
+mod group;
 mod havn_ws;
 mod lark;
 mod live;
@@ -114,10 +116,11 @@ async fn main() -> Result<()> {
         cards: Arc::default(),
     };
 
-    let delivered = Arc::new(havn_ws::Delivered::load(
-        state_path(&cli, &cfg.account_id),
-        &cfg.account_id,
-    ));
+    let state = state_path(&cli, &cfg.account_id);
+    group::keep_beside(state.as_deref());
+    tokio::spawn(group::learn_bot(lark.clone()));
+    tokio::spawn(group::keep_scopes(lark.clone()));
+    let delivered = Arc::new(havn_ws::Delivered::load(state, &cfg.account_id));
     let ws = WsClient::spawn(WsConfig {
         gateway_url: cfg.havn_gateway.clone(),
         adapter_token: cfg.adapter_token.clone(),
@@ -178,6 +181,8 @@ async fn main() -> Result<()> {
         r = outbound_task => warn!(result = ?r, "havn outbound loop exited unexpectedly"),
     }
     drop(outbound_tx);
+    // A thread first seen in the last moment before stopping is kept too.
+    group::write_threads();
     Ok(())
 }
 
@@ -229,7 +234,8 @@ struct Out {
 /// havn → Lark. Drain WS-received frames: each `Outbound` goes to the
 /// worker of its chat ([`Chats`]), which delivers them in order. The
 /// gateway's commands are said in the log, for the bot's menu, which Lark
-/// lets be set up on the Developer Console only. Other frame kinds are
+/// lets be set up on the Developer Console only; they and whether the
+/// gateway takes group messages are noted for those. Other frame kinds are
 /// logged and ignored.
 async fn havn_outbound_loop(
     out: Out,
@@ -244,6 +250,7 @@ async fn havn_outbound_loop(
             ChannelFrame::Outbound(o) => chats.outbound(o),
             ChannelFrame::Writing(w) => chats.writing(w),
             ChannelFrame::Commands(c) => {
+                group::gateway_said(c.groups, c.commands.iter().map(|c| c.name.clone()));
                 if menu.as_ref() != Some(&c.commands) {
                     let keys: Vec<&str> = c.commands.iter().map(|c| c.name.as_str()).collect();
                     info!(
@@ -517,11 +524,12 @@ async fn chat_worker(
 static REPLY_IDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// What reply `o` answers loses its Typing reaction. One that names the
-/// message (`in_reply_to`) answers that one. The agent's in a private chat
-/// name none; the end of a turn (a reply with an id) answers the oldest
-/// there, and one without an id (a scheduled report, a notice) answers
-/// none, once the gateway gives ids; an older gateway gives none, and then
-/// any reply answers the oldest. A part of a reply has more to come.
+/// message (`in_reply_to`) answers that one, as every reply in a group does.
+/// The agent's in a private chat name none; the end of a turn (a reply with
+/// an id) answers the oldest there, and one without an id (a scheduled
+/// report, a notice) answers none, once the gateway gives ids; an older
+/// gateway gives none, and then any reply answers the oldest. A part of a
+/// reply has more to come.
 fn answered(working: &events::Working, o: &ChannelOutbound) {
     if o.reply.is_some() {
         REPLY_IDS.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -531,6 +539,7 @@ fn answered(working: &events::Working, o: &ChannelOutbound) {
     }
     match (o.in_reply_to.as_deref(), &o.reply) {
         (Some(answers), _) => working.replied(&o.to, Some(answers)),
+        (None, _) if group::in_group(&o.to) => {}
         (None, Some(_)) => working.replied(&o.to, None),
         (None, None) if !REPLY_IDS.load(std::sync::atomic::Ordering::Relaxed) => {
             working.replied(&o.to, None);
@@ -589,6 +598,7 @@ impl Chats {
     /// frame it has not taken yet.
     fn writing(&self, w: types::ChannelWriting) {
         REPLY_IDS.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.out.working.being_written(&w.to);
         let mut map = inboxes(&self.inboxes);
         let inbox = map.entry(w.to.clone()).or_insert_with(|| {
             let inbox = Arc::new(Inbox::default());
@@ -607,8 +617,9 @@ impl Chats {
 
 /// Who an outbound `to` names, as Lark's `receive_id_type` and id: a
 /// sender's `union_id` (`on_`) or, from an older gateway or a reply kept
-/// from before, its `open_id` (`ou_`); a chat (`oc_`).
-pub(crate) fn recipient(to: &str) -> Option<(&'static str, &str)> {
+/// from before, its `open_id` (`ou_`); a chat (`oc_`); a thread (`omt_`),
+/// as [`lark::THREAD`] and the message what goes to it replies to.
+pub(crate) fn recipient(to: &str) -> Option<(&'static str, String)> {
     let id = to.strip_prefix(events::PREFIX)?;
     let kind = if id.starts_with("on_") {
         "union_id"
@@ -616,10 +627,18 @@ pub(crate) fn recipient(to: &str) -> Option<(&'static str, &str)> {
         "open_id"
     } else if id.starts_with("oc_") {
         "chat_id"
+    } else if id.starts_with("omt_") {
+        return group::thread(id).map(|t| {
+            if t.gone {
+                ("chat_id", t.chat)
+            } else {
+                (lark::THREAD, t.anchor)
+            }
+        });
     } else {
         return None;
     };
-    Some((kind, id))
+    Some((kind, id.to_string()))
 }
 
 /// Where a reply's messages go: the first as a reply to the message it
@@ -627,7 +646,7 @@ pub(crate) fn recipient(to: &str) -> Option<(&'static str, &str)> {
 /// rest to its recipient.
 struct Target<'a> {
     reply_to: Option<&'a str>,
-    to: Option<(&'static str, &'a str)>,
+    to: Option<(&'static str, String)>,
     /// The recipient as the gateway names it, which presses must come from.
     named: &'a str,
 }
@@ -644,12 +663,18 @@ impl<'a> Target<'a> {
     /// Send one message, of `msg_type` and its `content` JSON.
     async fn send(&mut self, lark: &LarkClient, msg_type: &str, content: &Value) -> Result<Sent> {
         let content = content.to_string();
-        let sent = match (self.reply_to, self.to) {
-            (Some(message_id), _) => lark.reply_message(message_id, msg_type, &content).await?,
-            (None, Some((kind, id))) => lark.send_message(kind, id, msg_type, &content).await?,
+        let sent = match (self.reply_to, &self.to) {
+            (Some(_), _) | (None, Some(_)) => {
+                let to = self
+                    .to
+                    .as_ref()
+                    .map_or(("", ""), |(k, id)| (*k, id.as_str()));
+                lark.post_message(self.reply_to, to, msg_type, &content, true)
+                    .await?
+            }
             (None, None) => {
                 bail!(
-                    "outbound has no in_reply_to and a `to` naming no Lark user or chat; cannot route"
+                    "outbound has no in_reply_to and a `to` naming no Lark user, chat or thread it knows; cannot route"
                 )
             }
         };
@@ -916,9 +941,18 @@ mod tests {
 
     #[test]
     fn a_reply_goes_to_the_id_its_to_names() {
-        assert_eq!(recipient("lark:on_1"), Some(("union_id", "on_1")));
-        assert_eq!(recipient("lark:ou_1"), Some(("open_id", "ou_1")));
-        assert_eq!(recipient("lark:oc_1"), Some(("chat_id", "oc_1")));
+        let to = |kind: &'static str, id: &str| Some((kind, id.to_string()));
+        assert_eq!(recipient("lark:on_1"), to("union_id", "on_1"));
+        assert_eq!(recipient("lark:ou_1"), to("open_id", "ou_1"));
+        assert_eq!(recipient("lark:oc_1"), to("chat_id", "oc_1"));
+        // A thread takes replies to its first message; one not seen, none.
+        group::note_thread("omt_r1", "oc_1", "om_first");
+        assert_eq!(recipient("lark:omt_r1"), to(lark::THREAD, "om_first"));
+        assert_eq!(recipient("lark:omt_other"), None);
+        // One whose first message is gone: its group.
+        group::note_thread("omt_r2", "oc_2", "om_first2");
+        let _ = group::thread_gone("om_first2");
+        assert_eq!(recipient("lark:omt_r2"), to("chat_id", "oc_2"));
         assert_eq!(recipient("lark:x"), None);
         assert_eq!(recipient("tg:1"), None);
         // A reply to an item of the bot's menu, which is no message, goes
@@ -1026,7 +1060,7 @@ mod tests {
 
     #[tokio::test]
     async fn replies_are_marked_delivered_in_their_chat_s_order() {
-        let d = std::env::temp_dir().join(format!("havn-lark-chats-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("havn-lark-workers-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let path = havn_ws::Delivered::file_in(&d, "bot");
