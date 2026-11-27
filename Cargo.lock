@@ -584,6 +584,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64",
+ "bytes",
  "cbc",
  "chrono",
  "clap",

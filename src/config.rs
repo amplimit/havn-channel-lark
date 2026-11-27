@@ -97,20 +97,13 @@ pub struct Config {
     #[serde(default)]
     pub encrypt_key: Option<String>,
 
-    /// OpenAI-compatible API key for Whisper STT of voice messages.
-    /// Optional — without it, inbound audio is dropped with a warn.
-    /// The key never leaves this daemon; havn never sees it.
+    /// No longer used: voice messages go to the gateway, which transcribes
+    /// them (havn issue #164). Taken, so a config that has them still loads;
+    /// the daemon says so in its log.
     #[serde(default)]
     pub openai_api_key: Option<String>,
-
-    /// Override the Whisper endpoint (default `https://api.openai.com/v1`).
-    /// Groq's `https://api.groq.com/openai/v1` is the documented free-tier
-    /// path.
     #[serde(default)]
     pub whisper_base_url: Option<String>,
-
-    /// Override the Whisper model name (default `whisper-1`). Groq uses
-    /// `whisper-large-v3-turbo`.
     #[serde(default)]
     pub whisper_model: Option<String>,
 }

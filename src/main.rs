@@ -11,21 +11,25 @@
 //! restart resumes from it. A background task keeps the
 //! `tenant_access_token` fresh.
 //!
-//! 1:1 (`p2p`) chats only. Inbound: text, voice (downloaded +
-//! Groq/Whisper STT), location are native; image/file are surfaced as a
-//! text marker (havn content is URL-based with no file host, and Lark
-//! resources need the adapter's token). Outbound: text, image, file are
-//! native (the agent's URL is fetched and re-uploaded to Lark).
+//! 1:1 (`p2p`) chats only. Inbound: text, rich text and locations as
+//! such; images, files, voice messages and videos downloaded and given to
+//! the gateway ([`gateway`]) as the message's attachments; a press on a
+//! card's button and an item of the bot's menu as what the person typed.
+//! Outbound: replies as cards ([`card`]) of the agent's Markdown, with the
+//! gateway's buttons and questions; files fetched from the gateway and sent
+//! as images or files, their captions after them; a `Typing` reaction on
+//! each message while its reply is due.
 
 #![forbid(unsafe_code)]
 
+mod card;
 mod config;
 mod events;
+mod gateway;
 mod havn_ws;
 mod lark;
 mod longconn;
 mod types;
-mod whisper;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -33,18 +37,18 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result, bail};
 use clap::Parser;
-use serde_json::json;
+use serde_json::{Value, json};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::{Config, Events};
 use crate::events::Incoming;
+use crate::gateway::Gateway;
 use crate::havn_ws::{WsClient, WsConfig};
-use crate::lark::LarkClient;
+use crate::lark::{LarkClient, Sent};
 use crate::types::{ChannelFrame, ChannelMessageContent, ChannelOutbound};
-use crate::whisper::Whisper;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -93,33 +97,25 @@ async fn main() -> Result<()> {
     .context("Lark client init")?;
     lark::spawn_token_refresher(lark.clone(), expire);
 
-    let whisper = match cfg.openai_api_key.as_ref() {
-        Some(k) if !k.is_empty() => Some(
-            Whisper::new(
-                k.clone(),
-                cfg.whisper_base_url.clone(),
-                cfg.whisper_model.clone(),
-            )
-            .context("Whisper init")?,
-        ),
-        _ => {
-            info!("no openai_api_key configured — inbound voice messages will be dropped");
-            None
-        }
+    say_unused(&cfg);
+    let gateway = Gateway::new(
+        &cfg.havn_gateway,
+        &cfg.adapter_token,
+        &cfg.channel_id,
+        &cfg.account_id,
+    )
+    .context("havn gateway client init")?;
+    let out = Out {
+        lark: lark.clone(),
+        gateway: gateway.clone(),
+        working: events::Working::new(lark.clone()),
+        cards: Arc::default(),
     };
 
-    // The last reply delivered, to resume from.
-    let state = cli.state.clone().or_else(|| {
-        // systemd sets it to the unit's StateDirectory (the first, when
-        // there are several).
-        let dir = std::env::var("STATE_DIRECTORY")
-            .ok()
-            .and_then(|dirs| dirs.split(':').next().map(PathBuf::from))
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .or_else(|| cli.config.parent().map(std::path::Path::to_path_buf))?;
-        Some(havn_ws::Delivered::file_in(&dir, &cfg.account_id))
-    });
-    let delivered = Arc::new(havn_ws::Delivered::load(state, &cfg.account_id));
+    let delivered = Arc::new(havn_ws::Delivered::load(
+        state_path(&cli, &cfg.account_id),
+        &cfg.account_id,
+    ));
     let ws = WsClient::spawn(WsConfig {
         gateway_url: cfg.havn_gateway.clone(),
         adapter_token: cfg.adapter_token.clone(),
@@ -136,7 +132,11 @@ async fn main() -> Result<()> {
     // ChannelFrame::Inbound.
     let incoming = Incoming {
         lark: lark.clone(),
-        whisper: whisper.clone(),
+        gateway,
+        delivered: Arc::clone(&delivered),
+        working: out.working.clone(),
+        cards: Arc::clone(&out.cards),
+        people: Arc::default(),
         outbound_tx: outbound_tx.clone(),
         account_id: cfg.account_id.clone(),
         seq: Arc::new(AtomicU64::new(1)),
@@ -168,7 +168,7 @@ async fn main() -> Result<()> {
     };
 
     // Outbound: havn → Lark.
-    let outbound_task = tokio::spawn(havn_outbound_loop(lark.clone(), inbound_rx, delivered));
+    let outbound_task = tokio::spawn(havn_outbound_loop(out, inbound_rx, delivered));
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => info!("received Ctrl-C, shutting down"),
@@ -177,6 +177,33 @@ async fn main() -> Result<()> {
     }
     drop(outbound_tx);
     Ok(())
+}
+
+/// Say the settings a config may still have that are no longer used: voice
+/// messages go to the gateway, which transcribes them (havn issue #164).
+fn say_unused(cfg: &Config) {
+    if cfg.openai_api_key.is_some() || cfg.whisper_base_url.is_some() || cfg.whisper_model.is_some()
+    {
+        warn!(
+            "openai_api_key, whisper_base_url and whisper_model are no longer used: voice \
+             messages go to the gateway, which transcribes them with [transcription] in its \
+             config.toml"
+        );
+    }
+}
+
+/// Where the last reply delivered is kept, to resume from: `--state`, else
+/// in systemd's `StateDirectory` (the first, when there are several), else
+/// next to the config file.
+fn state_path(cli: &Cli, account_id: &str) -> Option<PathBuf> {
+    cli.state.clone().or_else(|| {
+        let dir = std::env::var("STATE_DIRECTORY")
+            .ok()
+            .and_then(|dirs| dirs.split(':').next().map(PathBuf::from))
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .or_else(|| cli.config.parent().map(std::path::Path::to_path_buf))?;
+        Some(havn_ws::Delivered::file_in(&dir, account_id))
+    })
 }
 
 fn init_tracing() {
@@ -188,24 +215,41 @@ fn init_tracing() {
         .init();
 }
 
-/// havn → Lark. Drain WS-received frames: each `Outbound` goes to the
-/// worker of its chat ([`Chats`]), which delivers them in order. Other
-/// frame kinds are logged and ignored.
-async fn havn_outbound_loop(
+/// What delivering a reply takes.
+#[derive(Clone)]
+struct Out {
     lark: Arc<LarkClient>,
+    gateway: Gateway,
+    working: events::Working,
+    cards: Arc<Mutex<card::Cards>>,
+}
+
+/// havn → Lark. Drain WS-received frames: each `Outbound` goes to the
+/// worker of its chat ([`Chats`]), which delivers them in order. The
+/// gateway's commands are said in the log, for the bot's menu, which Lark
+/// lets be set up on the Developer Console only. Other frame kinds are
+/// logged and ignored.
+async fn havn_outbound_loop(
+    out: Out,
     mut inbound_rx: tokio::sync::mpsc::Receiver<ChannelFrame>,
     delivered: Arc<havn_ws::Delivered>,
 ) -> Result<()> {
-    let chats = Chats::new(lark, delivered);
+    let chats = Chats::new(out, delivered);
+    // The commands last said, so a reconnect does not say them again.
+    let mut menu: Option<Vec<types::ChannelCommand>> = None;
     while let Some(frame) = inbound_rx.recv().await {
         match frame {
             ChannelFrame::Outbound(o) => chats.outbound(o),
             ChannelFrame::Commands(c) => {
-                info!(
-                    commands = c.commands.len(),
-                    sender_aliases = c.sender_aliases,
-                    "the gateway's commands"
-                );
+                if menu.as_ref() != Some(&c.commands) {
+                    let keys: Vec<&str> = c.commands.iter().map(|c| c.name.as_str()).collect();
+                    info!(
+                        commands = %keys.join(", "),
+                        "the gateway's commands: on the Developer Console, give the bot's menu an \
+                         item for each to offer, its event key the command's name"
+                    );
+                    menu = Some(c.commands);
+                }
             }
             ChannelFrame::Pong => {}
             ChannelFrame::Inbound(_) => {
@@ -314,7 +358,7 @@ fn inboxes(all: &Inboxes) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Inbox
 /// only that one. Each reply is marked delivered once it is. It ends, its
 /// inbox let go with it, when its chat had nothing for [`CHAT_IDLE`].
 async fn chat_worker(
-    lark: Arc<LarkClient>,
+    out: Out,
     to: String,
     inbox: Arc<Inbox>,
     all: Inboxes,
@@ -344,7 +388,7 @@ async fn chat_worker(
             }
             continue;
         };
-        let sent = std::panic::AssertUnwindSafe(deliver_outbound(&lark, &o))
+        let sent = std::panic::AssertUnwindSafe(deliver_outbound(&out, &o))
             .catch_unwind()
             .await;
         match sent {
@@ -358,21 +402,26 @@ async fn chat_worker(
             ),
         }
         delivered.mark(o.seq);
+        // A reply came, or the end of one: a message waits on one fewer. A
+        // part of one has more to come.
+        if !o.partial {
+            out.working.replied(&o.to, o.in_reply_to.as_deref());
+        }
         last = tokio::time::Instant::now();
     }
 }
 
 /// Where replies go: each chat's inbox, and its worker.
 struct Chats {
-    lark: Arc<LarkClient>,
+    out: Out,
     delivered: Arc<havn_ws::Delivered>,
     inboxes: Inboxes,
 }
 
 impl Chats {
-    fn new(lark: Arc<LarkClient>, delivered: Arc<havn_ws::Delivered>) -> Self {
+    fn new(out: Out, delivered: Arc<havn_ws::Delivered>) -> Self {
         Self {
-            lark,
+            out,
             delivered,
             inboxes: Inboxes::default(),
         }
@@ -392,7 +441,7 @@ impl Chats {
         let inbox = map.entry(o.to.clone()).or_insert_with(|| {
             let inbox = Arc::new(Inbox::default());
             tokio::spawn(chat_worker(
-                Arc::clone(&self.lark),
+                self.out.clone(),
                 o.to.clone(),
                 Arc::clone(&inbox),
                 Arc::clone(&self.inboxes),
@@ -426,89 +475,101 @@ fn recipient(to: &str) -> Option<(&'static str, &str)> {
     Some((kind, id))
 }
 
-async fn deliver_outbound(lark: &LarkClient, o: &ChannelOutbound) -> Result<()> {
-    // The end of a reply that says nothing more sends nothing.
-    if matches!(&o.content, ChannelMessageContent::Text { text } if text.trim().is_empty()) {
-        return Ok(());
-    }
-    let reply_id = o.in_reply_to.as_deref();
-    let to = recipient(&o.to);
-    let (msg_type, content, extra_text) = build_outbound(lark, &o.content).await?;
-    send_one(lark, reply_id, to, msg_type, &content).await?;
-    if let Some(t) = extra_text {
-        let c = serde_json::to_string(&json!({ "text": t }))?;
-        send_one(lark, reply_id, to, "text", &c).await?;
-    }
-    Ok(())
+/// Where a reply's messages go: the first as a reply to the message it
+/// answers, when that is a message (an item of the bot's menu is none), the
+/// rest to its recipient.
+struct Target<'a> {
+    reply_to: Option<&'a str>,
+    to: Option<(&'static str, &'a str)>,
+    /// The recipient as the gateway names it, which presses must come from.
+    named: &'a str,
 }
 
-/// Send one message, threading under `reply_id` if present, else to `to`.
-async fn send_one(
-    lark: &LarkClient,
-    reply_id: Option<&str>,
-    to: Option<(&str, &str)>,
-    msg_type: &str,
-    content: &str,
-) -> Result<()> {
-    if let Some(rid) = reply_id {
-        lark.reply_message(rid, msg_type, content).await?;
-    } else if let Some((kind, id)) = to {
-        lark.send_message(kind, id, msg_type, content).await?;
-    } else {
-        bail!("outbound has no in_reply_to and a `to` naming no Lark user or chat; cannot route");
+impl<'a> Target<'a> {
+    fn of(o: &'a ChannelOutbound) -> Self {
+        Self {
+            reply_to: o.in_reply_to.as_deref().filter(|id| id.starts_with("om_")),
+            to: recipient(&o.to),
+            named: &o.to,
+        }
     }
-    Ok(())
+
+    /// Send one message, of `msg_type` and its `content` JSON.
+    async fn send(&mut self, lark: &LarkClient, msg_type: &str, content: &Value) -> Result<Sent> {
+        let content = content.to_string();
+        let sent = match (self.reply_to, self.to) {
+            (Some(message_id), _) => lark.reply_message(message_id, msg_type, &content).await?,
+            (None, Some((kind, id))) => lark.send_message(kind, id, msg_type, &content).await?,
+            (None, None) => {
+                bail!(
+                    "outbound has no in_reply_to and a `to` naming no Lark user or chat; cannot route"
+                )
+            }
+        };
+        // The rest go to the recipient, when it can be named.
+        if self.to.is_some() {
+            self.reply_to = None;
+        }
+        Ok(sent)
+    }
 }
 
-/// Build `(msg_type, content_json, optional_extra_text)` for an outbound
-/// havn content. Image/File are native (fetch the URL, re-upload to Lark);
-/// Audio/Location/Contact flatten to a text marker (matches the gateway's
-/// own flattening, and what the Telegram adapter does).
-async fn build_outbound(
-    lark: &LarkClient,
-    content: &ChannelMessageContent,
-) -> Result<(&'static str, String, Option<String>)> {
-    let s = |v: &serde_json::Value| serde_json::to_string(v).map_err(|e| anyhow!(e));
-    match content {
-        ChannelMessageContent::Text { text } => Ok(("text", s(&json!({ "text": text }))?, None)),
+/// Whether Lark answered and refused a message, as for a card it does not
+/// take: one sent again some other way does not come twice.
+fn refused(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<lark::Refused>().is_some()
+}
+
+/// Deliver one reply: text as cards (with the gateway's buttons under the
+/// last), a question of several answers as a card with a menu, and a file
+/// fetched from the gateway and sent as an image or a file, its caption in
+/// a card after it. Audio, locations and contacts go as text markers.
+async fn deliver_outbound(out: &Out, o: &ChannelOutbound) -> Result<()> {
+    let mut target = Target::of(o);
+    let text = match &o.content {
+        ChannelMessageContent::Text { text } => text.clone(),
         ChannelMessageContent::Image { url, caption } => {
-            let bytes = lark
-                .fetch_url(url)
-                .await
-                .context("fetch outbound image url")?;
-            let image_key = lark
-                .upload_image(bytes)
-                .await
-                .context("upload image to Lark")?;
-            // Lark image messages carry no caption; deliver it as a follow-up text.
-            Ok((
-                "image",
-                s(&json!({ "image_key": image_key }))?,
-                caption.clone(),
-            ))
+            match out.gateway.fetch(url).await {
+                Ok(bytes) => match send_file(out, &mut target, bytes, "image").await {
+                    Ok(()) => caption.clone().unwrap_or_default(),
+                    Err(e) => {
+                        warn!(error = %format!("{e:#}"), "lark could not take an image");
+                        "(An image could not be delivered.)".to_string()
+                    }
+                },
+                // An address of the agent's own: the adapter fetches only the
+                // gateway's files.
+                Err(_) => match caption {
+                    Some(c) => format!("[image: {url}]\n{c}"),
+                    None => format!("[image: {url}]"),
+                },
+            }
         }
-        ChannelMessageContent::File { url, filename } => {
-            let bytes = lark
-                .fetch_url(url)
-                .await
-                .context("fetch outbound file url")?;
-            let file_key = lark
-                .upload_file(bytes, filename)
-                .await
-                .context("upload file to Lark")?;
-            Ok(("file", s(&json!({ "file_key": file_key }))?, None))
-        }
+        ChannelMessageContent::File {
+            url,
+            filename,
+            caption,
+        } => match out.gateway.fetch(url).await {
+            Ok(bytes) => match send_file(out, &mut target, bytes, filename).await {
+                Ok(()) => caption.clone().unwrap_or_default(),
+                Err(e) => {
+                    warn!(filename, error = %format!("{e:#}"), "lark could not take a file");
+                    format!("(A file, {filename}, could not be delivered.)")
+                }
+            },
+            Err(e) => {
+                warn!(filename, error = %format!("{e:#}"), "could not fetch a file the agent sent");
+                format!("(A file, {filename}, could not be delivered.)")
+            }
+        },
         ChannelMessageContent::Audio {
             transcript,
             duration_seconds,
             ..
-        } => {
-            let t = match duration_seconds {
-                Some(d) => format!("[voice, {d}s] {transcript}"),
-                None => format!("[voice] {transcript}"),
-            };
-            Ok(("text", s(&json!({ "text": t }))?, None))
-        }
+        } => match duration_seconds {
+            Some(d) => format!("[voice, {d}s] {transcript}"),
+            None => format!("[voice] {transcript}"),
+        },
         ChannelMessageContent::Location {
             latitude,
             longitude,
@@ -517,24 +578,162 @@ async fn build_outbound(
         } => {
             let label = name.clone().unwrap_or_default();
             let coords = format!("{latitude:.6},{longitude:.6}");
-            let t = if label.is_empty() {
+            if label.is_empty() {
                 format!("[location: {coords}]")
             } else {
                 format!("[location: {coords} ({label})]")
-            };
-            Ok(("text", s(&json!({ "text": t }))?, None))
+            }
         }
         ChannelMessageContent::Contact {
             display_name,
             phone_number,
             ..
-        } => {
-            let t = match phone_number {
-                Some(ph) => format!("[contact: {display_name} {ph}]"),
-                None => format!("[contact: {display_name}]"),
-            };
-            Ok(("text", s(&json!({ "text": t }))?, None))
+        } => match phone_number {
+            Some(ph) => format!("[contact: {display_name} {ph}]"),
+            None => format!("[contact: {display_name}]"),
+        },
+    };
+    // A question of several answers: its text with a menu; its text alone,
+    // which says how to answer by typing, when Lark refuses the card.
+    if let Some(poll) = &o.poll {
+        let markdown = if text.trim().is_empty() {
+            poll.question.clone()
+        } else {
+            text.clone()
+        };
+        if markdown.chars().count() <= card::PART_CHARS
+            && let Some(question) = card::question_card(&markdown, poll, target.named)
+        {
+            match target.send(&out.lark, "interactive", &question).await {
+                Ok(sent) => {
+                    note_card(out, &sent, &markdown);
+                    return Ok(());
+                }
+                Err(e) if refused(&e) => {
+                    warn!(error = %format!("{e:#}"), "lark refused a question's card; sending its text");
+                }
+                Err(e) => return Err(e),
+            }
         }
+    }
+    // The end of a reply whose parts were all sent already says nothing
+    // more (havn issue #212): it only ends the turn.
+    if text.trim().is_empty() && o.buttons.is_empty() {
+        return Ok(());
+    }
+    send_text(out, &mut target, &text, &o.buttons).await
+}
+
+/// Send `markdown` as cards, as many as it takes, the buttons under the
+/// last. A card Lark refuses goes as plain text, without buttons: the text
+/// says how to answer by typing.
+async fn send_text(
+    out: &Out,
+    target: &mut Target<'_>,
+    markdown: &str,
+    buttons: &[Vec<types::Button>],
+) -> Result<()> {
+    let mut parts = card::split(markdown);
+    if parts.is_empty() {
+        parts.push(String::new());
+    }
+    let last = parts.len() - 1;
+    for (i, part) in parts.iter().enumerate() {
+        let under = if i == last { buttons } else { &[] };
+        let shown = card::text_card(part, under, target.named);
+        match target.send(&out.lark, "interactive", &shown).await {
+            Ok(sent) => {
+                if !under.is_empty() {
+                    note_card(out, &sent, part);
+                }
+            }
+            Err(e) if refused(&e) => {
+                warn!(error = %format!("{e:#}"), "lark refused a card; sending its text as it is");
+                let plain = json!({ "text": card::plain(part) });
+                target.send(&out.lark, "text", &plain).await?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// A card with buttons or a question was sent: kept, to show it without
+/// them once pressed.
+fn note_card(out: &Out, sent: &Sent, markdown: &str) {
+    out.cards
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .note(&sent.message_id, markdown);
+}
+
+/// The largest image Lark takes as one.
+const IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
+/// The largest file Lark takes.
+const FILE_MAX_BYTES: usize = 30 * 1024 * 1024;
+
+/// Send `bytes`, a file the agent sent named `filename`: as an image Lark
+/// shows when its bytes are one (PNG, JPEG, GIF, WebP, at most 10 MB), else,
+/// or when Lark refuses it as one, as a file.
+async fn send_file(
+    out: &Out,
+    target: &mut Target<'_>,
+    bytes: Vec<u8>,
+    filename: &str,
+) -> Result<()> {
+    if events::image_type(&bytes).is_some() && bytes.len() <= IMAGE_MAX_BYTES {
+        let shown = match out.lark.upload_image(bytes.clone()).await {
+            Ok(image_key) => {
+                target
+                    .send(&out.lark, "image", &json!({ "image_key": image_key }))
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        match shown {
+            Ok(_) => return Ok(()),
+            Err(e) if refused(&e) || format!("{e:#}").contains("image upload failed") => {
+                warn!(filename, error = %format!("{e:#}"), "lark refused an image; sending it as a file");
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if bytes.len() > FILE_MAX_BYTES {
+        bail!("the file is larger than Lark's 30 MB");
+    }
+    let name = if filename.contains('.') || events::image_type(&bytes).is_none() {
+        filename.to_string()
+    } else {
+        format!(
+            "{filename}.{}",
+            events::image_type(&bytes).map_or("bin", |(e, _)| e)
+        )
+    };
+    let file_key = out
+        .lark
+        .upload_file(bytes, &name, file_type(&name))
+        .await
+        .context("upload file to Lark")?;
+    target
+        .send(&out.lark, "file", &json!({ "file_key": file_key }))
+        .await?;
+    Ok(())
+}
+
+/// Lark's `file_type` for a file named `name`.
+fn file_type(name: &str) -> &'static str {
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "opus" => "opus",
+        "mp4" => "mp4",
+        "pdf" => "pdf",
+        "doc" | "docx" => "doc",
+        "xls" | "xlsx" => "xls",
+        "ppt" | "pptx" => "ppt",
+        _ => "stream",
     }
 }
 
@@ -549,6 +748,21 @@ mod tests {
             to: to.into(),
             in_reply_to: None,
             content: ChannelMessageContent::Text { text: text.into() },
+            buttons: Vec::new(),
+            poll: None,
+            partial: false,
+        }
+    }
+
+    fn out() -> Out {
+        // Lark is not there: each delivery fails.
+        let lark = LarkClient::unauthenticated("http://127.0.0.1:9".into(), "a".into(), "s".into())
+            .unwrap();
+        Out {
+            gateway: gateway::Gateway::new("ws://127.0.0.1:9", "t", "lark", "bot").unwrap(),
+            working: events::Working::new(Arc::clone(&lark)),
+            cards: Arc::default(),
+            lark,
         }
     }
 
@@ -559,6 +773,23 @@ mod tests {
         assert_eq!(recipient("lark:oc_1"), Some(("chat_id", "oc_1")));
         assert_eq!(recipient("lark:x"), None);
         assert_eq!(recipient("tg:1"), None);
+        // A reply to an item of the bot's menu, which is no message, goes
+        // to the person.
+        let mut o = outbound(1, "lark:on_1", "x");
+        o.in_reply_to = Some("menu:ev_1".into());
+        assert_eq!(Target::of(&o).reply_to, None);
+        o.in_reply_to = Some("om_1".into());
+        assert_eq!(Target::of(&o).reply_to, Some("om_1"));
+    }
+
+    #[test]
+    fn a_file_goes_as_lark_s_kind_of_it() {
+        assert_eq!(file_type("report.PDF"), "pdf");
+        assert_eq!(file_type("a.docx"), "doc");
+        assert_eq!(file_type("sheet.xlsx"), "xls");
+        assert_eq!(file_type("talk.opus"), "opus");
+        assert_eq!(file_type("archive.tar.gz"), "stream");
+        assert_eq!(file_type("noextension"), "stream");
     }
 
     #[test]
@@ -582,10 +813,7 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let path = havn_ws::Delivered::file_in(&d, "bot");
         let delivered = Arc::new(havn_ws::Delivered::load(Some(path.clone()), "bot"));
-        // Lark is not there: each delivery fails, and is marked all the same.
-        let lark = LarkClient::unauthenticated("http://127.0.0.1:9".into(), "a".into(), "s".into())
-            .unwrap();
-        let chats = Chats::new(lark, Arc::clone(&delivered));
+        let chats = Chats::new(out(), Arc::clone(&delivered));
         for (seq, to) in [(1, "lark:on_1"), (2, "lark:on_2"), (3, "lark:on_1")] {
             delivered.got(seq);
             chats.outbound(outbound(seq, to, "hi"));

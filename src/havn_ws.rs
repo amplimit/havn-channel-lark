@@ -552,6 +552,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             raw: None,
             sender_aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
+            attachments: Vec::new(),
         })
     }
 

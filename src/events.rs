@@ -8,18 +8,22 @@
 //!   retries make no second turn,
 //! - translates each inbound message into a havn `ChannelInbound` and
 //!   forwards it over the gateway WS, without the payload's Verification
-//!   Token and tenant key.
+//!   Token and tenant key, its files first given to the gateway;
+//! - takes a press on one of the bot's cards (`card.action.trigger`) and
+//!   an item of the bot's menu (`application.bot.menu_v6`) as what the
+//!   person typed, answering a press with the card without its buttons.
 //!
 //! The webhook also answers the one-time `url_verification` challenge and,
 //! with an Encrypt Key, refuses a request whose signature does not match or
 //! is older than [`SIGNED_FOR`].
 //!
-//! Lark wants an answer within 3 seconds, so translation (which may do a
-//! resource download + STT) runs in a worker of the message's chat, which
-//! takes the chat's messages in the order they came; the event is answered
-//! at once.
+//! Lark wants an answer within 3 seconds, so translation (which may
+//! download and upload a file) runs in a worker of the message's chat,
+//! which takes the chat's messages in the order they came; the event is
+//! answered at once.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -37,9 +41,13 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::lark::{EventEnvelope, LarkClient, MessageReceiveEvent, SenderId};
-use crate::types::{ChannelFrame, ChannelInbound, ChannelMessageContent};
-use crate::whisper::Whisper;
+use crate::card;
+use crate::gateway::Gateway;
+use crate::havn_ws::Delivered;
+use crate::lark::{
+    CardAction, EventEnvelope, LarkClient, MenuEvent, MessageReceiveEvent, SenderId,
+};
+use crate::types::{Attachment, ChannelFrame, ChannelInbound, ChannelMessageContent};
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
 
@@ -63,13 +71,71 @@ pub const SIGNED_FOR: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The workers of the chats messages came in, by chat: each takes its
 /// chat's messages in order.
-pub type Chats = Arc<Mutex<HashMap<String, mpsc::Sender<(MessageReceiveEvent, Value)>>>>;
+pub type Chats = Arc<Mutex<HashMap<String, mpsc::Sender<Arrival>>>>;
+
+/// What a chat's worker passes on, in order.
+pub enum Arrival {
+    /// A message a sender sent.
+    Message(Box<MessageReceiveEvent>, Value),
+    /// What a press or the bot's menu sends, as if the person typed it;
+    /// `react_on`, the card pressed, shows that its reply is due.
+    Said {
+        ids: SenderId,
+        message_id: String,
+        text: String,
+        raw: Value,
+        react_on: Option<String>,
+    },
+}
+
+/// The start of the message id of a press, which is no message to reply
+/// to: its reply goes to the person, in their private chat.
+pub const PRESS_PREFIX: &str = "press:";
+
+/// People whose private chats with the bot are known, at most; past that,
+/// the oldest are let go.
+const PEOPLE_KEPT: usize = 4096;
+
+/// Each person's private chat with the bot, by their ids, as their messages
+/// showed it.
+#[derive(Debug, Default)]
+pub struct People {
+    chats: HashMap<String, String>,
+    order: VecDeque<String>,
+}
+
+impl People {
+    fn note(&mut self, ids: &[String], chat: &str) {
+        for id in ids {
+            if self.chats.insert(id.clone(), chat.to_string()).is_none() {
+                self.order.push_back(id.clone());
+            }
+        }
+        while self.order.len() > PEOPLE_KEPT {
+            if let Some(oldest) = self.order.pop_front() {
+                self.chats.remove(&oldest);
+            }
+        }
+    }
+
+    fn chat_of(&self, ids: &[String]) -> Option<String> {
+        ids.iter().find_map(|id| self.chats.get(id).cloned())
+    }
+}
+
+/// The start of the message id of an item of the bot's menu chosen, which
+/// is no message: a reply to it is sent to the person.
+pub const MENU_PREFIX: &str = "menu:";
 
 /// What takes Lark's events, from either transport.
 #[derive(Clone)]
 pub struct Incoming {
     pub lark: Arc<LarkClient>,
-    pub whisper: Option<Whisper>,
+    pub gateway: Gateway,
+    pub delivered: Arc<Delivered>,
+    pub working: Working,
+    pub cards: Arc<Mutex<card::Cards>>,
+    pub people: Arc<Mutex<People>>,
     pub outbound_tx: mpsc::Sender<ChannelFrame>,
     pub account_id: String,
     pub seq: Arc<AtomicU64>,
@@ -80,7 +146,7 @@ pub struct Incoming {
 }
 
 /// What became of an event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Taken {
     /// Taken, or one not acted on (another kind, or taken before).
     Done,
@@ -88,6 +154,8 @@ pub enum Taken {
     Refused,
     /// Not readable: not JSON, or encrypted with another key.
     Unreadable,
+    /// A press on a card, answered with this.
+    Answer(Value),
 }
 
 /// Keys remembered up to [`SEEN_KEPT`] each, the oldest let go first.
@@ -183,9 +251,19 @@ impl Incoming {
             debug!(event_id = %env.header.event_id, "lark: an event taken before; dropping");
             return Taken::Done;
         }
-        if env.header.event_type != "im.message.receive_v1" {
-            debug!(event_type = %env.header.event_type, "lark: ignoring non-message event");
-            return Taken::Done;
+        match env.header.event_type.as_str() {
+            "im.message.receive_v1" => {}
+            "card.action.trigger" => {
+                return Taken::Answer(self.press(env.event, without_secrets(payload)));
+            }
+            "application.bot.menu_v6" => {
+                self.menu(env.event, without_secrets(payload), &env.header.event_id);
+                return Taken::Done;
+            }
+            other => {
+                debug!(event_type = %other, "lark: ignoring an event of another kind");
+                return Taken::Done;
+            }
         }
         let ev = match serde_json::from_value::<MessageReceiveEvent>(env.event) {
             Ok(ev) => ev,
@@ -201,13 +279,30 @@ impl Incoming {
         }
         // Translate + forward off the answer's path (Lark wants it within
         // 3s; STT/download can take longer), in the chat's order.
-        self.to_chat(ev, without_secrets(payload));
+        let chat = ev.message.chat_id.clone();
+        if ev.message.chat_type == "p2p" {
+            let (sender, aliases) = sender_ids(&ev.sender.sender_id);
+            let mut ids = aliases;
+            ids.push(sender);
+            self.people().note(&ids, &chat);
+        }
+        let _ = self.to_chat(
+            chat,
+            Arrival::Message(Box::new(ev), without_secrets(payload)),
+        );
         Taken::Done
     }
 
-    /// Hand `ev` to the worker of its chat, started when it has none.
-    fn to_chat(&self, ev: MessageReceiveEvent, raw: Value) {
-        let chat = ev.message.chat_id.clone();
+    fn people(&self) -> std::sync::MutexGuard<'_, People> {
+        self.people
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Hand `arrival` to the worker of `chat`, started when it has none:
+    /// whether it was, which it is not when the chat has as many waiting as
+    /// it may.
+    fn to_chat(&self, chat: String, arrival: Arrival) -> bool {
         let mut chats = self
             .chats
             .lock()
@@ -217,20 +312,18 @@ impl Incoming {
             tokio::spawn(chat_worker(self.clone(), chat.clone(), rx));
             tx
         });
-        if tx.try_send((ev, raw)).is_err() {
+        if tx.try_send(arrival).is_err() {
             warn!(chat = %chat, "lark: a chat has as many messages waiting as it may; dropping one");
+            return false;
         }
+        true
     }
 }
 
 /// Translate and forward the messages of `chat` one at a time, in the order
 /// they came. It ends after [`CHAT_IDLE`] with nothing to do, under the lock
 /// [`Incoming::to_chat`] adds with, so no message is left behind.
-async fn chat_worker(
-    incoming: Incoming,
-    chat: String,
-    mut rx: mpsc::Receiver<(MessageReceiveEvent, Value)>,
-) {
+async fn chat_worker(incoming: Incoming, chat: String, mut rx: mpsc::Receiver<Arrival>) {
     loop {
         let next = match tokio::time::timeout(CHAT_IDLE, rx.recv()).await {
             Ok(Some(next)) => next,
@@ -248,23 +341,25 @@ async fn chat_worker(
                 }
             }
         };
-        let (ev, raw) = next;
-        translate_and_forward(incoming.clone(), ev, raw).await;
+        translate_and_forward(incoming.clone(), next).await;
     }
 }
 
 /// `payload` without what is not the agent's to see: the app's
-/// Verification Token and the tenant's key.
+/// Verification Token, the tenant's key, and a press's token.
 fn without_secrets(mut payload: Value) -> Value {
     if let Some(header) = payload.get_mut("header").and_then(Value::as_object_mut) {
         header.remove("token");
         header.remove("tenant_key");
     }
-    if let Some(sender) = payload
-        .pointer_mut("/event/sender")
-        .and_then(Value::as_object_mut)
-    {
-        sender.remove("tenant_key");
+    for who in ["/event/sender", "/event/operator"] {
+        if let Some(who) = payload.pointer_mut(who).and_then(Value::as_object_mut) {
+            who.remove("tenant_key");
+        }
+    }
+    // A press's token, which updates its card.
+    if let Some(event) = payload.get_mut("event").and_then(Value::as_object_mut) {
+        event.remove("token");
     }
     payload
 }
@@ -335,6 +430,7 @@ async fn handle(
 
     match incoming.take_open(payload) {
         Taken::Done => StatusCode::OK.into_response(),
+        Taken::Answer(answer) => axum::Json(answer).into_response(),
         Taken::Refused => StatusCode::UNAUTHORIZED.into_response(),
         Taken::Unreadable => StatusCode::BAD_REQUEST.into_response(),
     }
@@ -429,37 +525,241 @@ pub fn sender_ids(id: &SenderId) -> (String, Vec<String>) {
     }
 }
 
-/// Translate one inbound Lark message into a havn `ChannelInbound` and
-/// send it over the WS. 1:1 (`p2p`) chats only.
-async fn translate_and_forward(incoming: Incoming, ev: MessageReceiveEvent, raw: Value) {
-    let m = &ev.message;
-    if m.chat_type != "p2p" {
-        debug!(chat_type = %m.chat_type, chat_id = %m.chat_id, "dropping non-p2p message (1:1 chats only)");
-        return;
+impl Incoming {
+    /// The sender's id and aliases as the gateway takes them: the
+    /// `open_id` alone for one that never took aliases.
+    fn ids(&self, id: &SenderId) -> (String, Vec<String>) {
+        if self.delivered.takes_aliases() {
+            sender_ids(id)
+        } else {
+            (format!("{PREFIX}{}", id.open_id), Vec::new())
+        }
     }
 
-    let Some(content) = build_content(&incoming, ev_message_payload(m), m).await else {
-        return;
+    /// A press on one of the bot's cards (`card.action.trigger`): what it
+    /// sends goes on as the person who pressed it typed it, once, and Lark
+    /// is answered with the card without its buttons. Only the person the
+    /// card was sent to may press it: one forwarded to someone else is not
+    /// theirs.
+    fn press(&self, event: Value, raw: Value) -> Value {
+        let ev: CardAction = match serde_json::from_value(event) {
+            Ok(ev) => ev,
+            Err(e) => {
+                warn!(error = %e, "lark: malformed card.action.trigger");
+                return json!({});
+            }
+        };
+        let value = &ev.action.value;
+        let ids = SenderId {
+            open_id: ev.operator.open_id.clone(),
+            union_id: ev.operator.union_id.clone(),
+        };
+        let (sender, aliases) = sender_ids(&ids);
+        let to = value
+            .get(card::TO)
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if to != sender && !aliases.iter().any(|a| a == to) {
+            warn!(message = %ev.context.open_message_id, "lark: a card pressed by someone it was not sent to");
+            return toast("error", "This is not yours to answer.");
+        }
+        let said = if value.get(card::KIND).and_then(Value::as_str) == Some(card::QUESTION) {
+            let numbers: Vec<String> = ev
+                .action
+                .form_value
+                .get(card::CHOICES)
+                .and_then(Value::as_array)
+                .map(|chosen| {
+                    chosen
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|n| n.parse::<u32>().is_ok())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if numbers.is_empty() {
+                return toast("warning", "Choose at least one.");
+            }
+            let answer = value
+                .get(card::ANSWER)
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            format!("{answer} {}", numbers.join(","))
+        } else {
+            match value.get(card::SAID).and_then(Value::as_str) {
+                Some(said) if !said.is_empty() => said.to_string(),
+                _ => return json!({}),
+            }
+        };
+        let message_id = ev.context.open_message_id.clone();
+        let mut ids_of_sender = aliases;
+        ids_of_sender.push(sender.clone());
+        let private = self.people().chat_of(&ids_of_sender);
+        // With the cards' lock held, so a card is marked pressed only once,
+        // and only once its press is on its way.
+        let mut cards = self
+            .cards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cards.was_pressed(&message_id) {
+            return toast("info", "This was answered already.");
+        }
+        // One of the bot's cards it knows, or one in the person's private
+        // chat with it: a copy forwarded into a group, pressed there, is
+        // not taken, so the agent's private reply goes to no group.
+        let ours = cards.knows(&message_id);
+        let in_private =
+            private.is_some() && private.as_deref() == Some(ev.context.open_chat_id.as_str());
+        if !ours && !in_private {
+            warn!(message = %message_id, "lark: a card pressed outside the person's private chat with the bot");
+            return toast("error", "Press it in your chat with the bot.");
+        }
+        // The person's private chat, where their messages wait in turn.
+        let chat = private.unwrap_or_else(|| sender.clone());
+        let queued = self.to_chat(
+            chat,
+            Arrival::Said {
+                ids,
+                message_id: format!("{PRESS_PREFIX}{message_id}"),
+                text: said,
+                raw,
+                react_on: Some(message_id.clone()),
+            },
+        );
+        if !queued {
+            return toast("warning", "Busy; try again in a moment.");
+        }
+        // The card without its buttons, so it is pressed once; one sent
+        // before a restart keeps them.
+        match cards.press(&message_id) {
+            card::Pressed::Now(Some(markdown)) => {
+                json!({ "card": { "type": "raw", "data": card::bare(&markdown) } })
+            }
+            _ => json!({}),
+        }
+    }
+
+    /// An item of the bot's menu (`application.bot.menu_v6`), set up on the
+    /// Developer Console with a command's name as its event key: the command
+    /// goes on as the person typed it.
+    fn menu(&self, event: Value, raw: Value, event_id: &str) {
+        let ev: MenuEvent = match serde_json::from_value(event) {
+            Ok(ev) => ev,
+            Err(e) => {
+                warn!(error = %e, "lark: malformed application.bot.menu_v6");
+                return;
+            }
+        };
+        let key = ev.event_key.trim();
+        if key.is_empty() {
+            return;
+        }
+        let text = if key.starts_with('/') {
+            key.to_string()
+        } else {
+            format!("/{key}")
+        };
+        let (sender, aliases) = sender_ids(&ev.operator.operator_id);
+        let mut ids = aliases;
+        ids.push(sender.clone());
+        // In turn with the person's messages, in their private chat; Lark
+        // names no chat for a menu item, so when none of their messages
+        // showed it yet, the menu's items wait in a line of their own.
+        let chat = self.people().chat_of(&ids).unwrap_or(sender);
+        let _ = self.to_chat(
+            chat,
+            Arrival::Said {
+                ids: ev.operator.operator_id,
+                message_id: format!("{MENU_PREFIX}{event_id}"),
+                text,
+                raw,
+                react_on: None,
+            },
+        );
+    }
+}
+
+/// A toast answering a press, of Lark's `type` (info, success, warning,
+/// error).
+fn toast(kind: &str, content: &str) -> Value {
+    json!({ "toast": { "type": kind, "content": content } })
+}
+
+/// Translate one arrival into a havn `ChannelInbound` and send it over the
+/// WS. 1:1 (`p2p`) chats only.
+async fn translate_and_forward(incoming: Incoming, arrival: Arrival) {
+    let (ids, message_id, content, attachments, raw, timestamp) = match arrival {
+        Arrival::Message(ev, raw) => {
+            let m = &ev.message;
+            if m.chat_type != "p2p" {
+                debug!(chat_type = %m.chat_type, chat_id = %m.chat_id, "dropping non-p2p message (1:1 chats only)");
+                return;
+            }
+            let (sender, aliases) = incoming.ids(&ev.sender.sender_id);
+            let mut attachments = Vec::new();
+            let Some(content) = build_content(
+                &incoming,
+                ev_message_payload(m),
+                m,
+                (&sender, &aliases),
+                &mut attachments,
+            )
+            .await
+            else {
+                return;
+            };
+            incoming
+                .working
+                .start(&sender, &m.message_id, &m.message_id);
+            let timestamp = m
+                .create_time
+                .as_deref()
+                .and_then(|s| s.parse::<i64>().ok())
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .unwrap_or_else(chrono::Utc::now);
+            (
+                ev.sender.sender_id,
+                m.message_id.clone(),
+                content,
+                attachments,
+                raw,
+                timestamp,
+            )
+        }
+        Arrival::Said {
+            ids,
+            message_id,
+            text,
+            raw,
+            react_on,
+        } => {
+            if let Some(react_on) = react_on {
+                let (sender, _) = incoming.ids(&ids);
+                incoming.working.start(&sender, &react_on, &message_id);
+            }
+            (
+                ids,
+                message_id,
+                ChannelMessageContent::Text { text },
+                Vec::new(),
+                raw,
+                chrono::Utc::now(),
+            )
+        }
     };
-
-    let timestamp = m
-        .create_time
-        .as_deref()
-        .and_then(|s| s.parse::<i64>().ok())
-        .and_then(chrono::DateTime::from_timestamp_millis)
-        .unwrap_or_else(chrono::Utc::now);
-
-    let (sender_id, sender_aliases) = sender_ids(&ev.sender.sender_id);
+    let (sender_id, sender_aliases) = incoming.ids(&ids);
     let inbound = ChannelInbound {
         seq: incoming.seq.fetch_add(1, Ordering::Relaxed),
         account_id: incoming.account_id.clone(),
         // Opaque platform message id; comes back as `in_reply_to` for replies.
-        channel_message_id: m.message_id.clone(),
+        channel_message_id: message_id,
         sender_id,
         content,
         timestamp,
         raw: Some(raw),
         sender_aliases,
+        attachments,
     };
     if incoming
         .outbound_tx
@@ -477,16 +777,20 @@ fn ev_message_payload(m: &crate::lark::LarkMessage) -> Value {
 }
 
 /// Map a Lark message's parsed content into a havn `ChannelMessageContent`.
-/// Voice is downloaded + transcribed (native). Location is native. Image /
-/// file are surfaced as a text marker: havn's content model is URL-based and
-/// has no file host, while Lark resources require the adapter's token to
-/// fetch — so the agent can't retrieve them directly. (Outbound image/file
-/// IS native — see `main.rs`.)
+/// Text, rich text and locations as such. An image, a file, a voice
+/// message or a video is downloaded from Lark and given to the gateway
+/// (havn issue #106), which keeps it in the agent's inbox and transcribes a
+/// voice message when it is set up to (havn issue #164); the message names
+/// it, or says it could not be received. A sticker, which Lark lets no bot
+/// download, is a line saying so.
 async fn build_content(
     incoming: &Incoming,
     content: Value,
     m: &crate::lark::LarkMessage,
+    sender: (&str, &[String]),
+    attachments: &mut Vec<Attachment>,
 ) -> Option<ChannelMessageContent> {
+    let key = |name: &str| content.get(name).and_then(Value::as_str).map(String::from);
     match m.message_type.as_str() {
         "text" => {
             let text = content.get("text").and_then(Value::as_str)?.to_string();
@@ -496,11 +800,6 @@ async fn build_content(
             // Rich text: flatten to the plain text we can extract.
             let text = flatten_post(&content);
             Some(ChannelMessageContent::Text { text })
-        }
-        "audio" => {
-            let file_key = content.get("file_key").and_then(Value::as_str)?;
-            let duration_ms = content.get("duration").and_then(Value::as_u64);
-            translate_audio(incoming, &m.message_id, file_key, duration_ms).await
         }
         "location" => {
             let lat = content.get("latitude").and_then(parse_coord)?;
@@ -516,18 +815,36 @@ async fn build_content(
                 address: None,
             })
         }
-        "image" => Some(ChannelMessageContent::Text {
-            text: "[image received — inbound images aren't fetchable by the agent yet]".into(),
-        }),
-        "file" => {
-            let name = content
-                .get("file_name")
-                .and_then(Value::as_str)
-                .unwrap_or("file");
-            Some(ChannelMessageContent::Text {
-                text: format!("[file received: {name}]"),
-            })
+        "image" => {
+            let image_key = key("image_key")?;
+            let received = receive(incoming, m, &image_key, "image", sender, None).await;
+            let name = received
+                .as_ref()
+                .map_or_else(|_| "image".to_string(), |a| a.name.clone());
+            Some(file_message(received, None, &name, attachments))
         }
+        "file" => {
+            let file_key = key("file_key")?;
+            let name = key("file_name").unwrap_or_else(|| "file".into());
+            let received = receive(incoming, m, &file_key, "file", sender, Some(&name)).await;
+            Some(file_message(received, None, &name, attachments))
+        }
+        "audio" => {
+            let file_key = key("file_key")?;
+            let seconds = content.get("duration").and_then(Value::as_u64).unwrap_or(0) / 1000;
+            let received = receive(incoming, m, &file_key, "audio", sender, Some(VOICE_NAME)).await;
+            let note = format!("[A voice message of {seconds} seconds.]");
+            Some(file_message(received, Some(&note), VOICE_NAME, attachments))
+        }
+        "media" => {
+            let file_key = key("file_key")?;
+            let name = key("file_name").unwrap_or_else(|| "video.mp4".into());
+            let received = receive(incoming, m, &file_key, "video", sender, Some(&name)).await;
+            Some(file_message(received, None, &name, attachments))
+        }
+        "sticker" => Some(ChannelMessageContent::Text {
+            text: "[The sender sent a sticker, which Lark lets no bot see.]".into(),
+        }),
         other => {
             debug!(
                 message_type = other,
@@ -538,42 +855,255 @@ async fn build_content(
     }
 }
 
-async fn translate_audio(
+/// The name a voice message goes to the gateway by.
+const VOICE_NAME: &str = "voice.ogg";
+
+/// Download resource `key` of message `m` from Lark and give it to the
+/// gateway as the sender's: `kind` says what it is (`image`, `audio`,
+/// `video`, `file`), `name` what to call it (an image is named by what its
+/// bytes are).
+async fn receive(
     incoming: &Incoming,
-    message_id: &str,
-    file_key: &str,
-    duration_ms: Option<u64>,
-) -> Option<ChannelMessageContent> {
-    let Some(whisper) = incoming.whisper.as_ref() else {
-        warn!(
-            file_key,
-            "received audio but no openai_api_key configured; dropping"
-        );
-        return None;
-    };
-    let bytes = match incoming
+    m: &crate::lark::LarkMessage,
+    key: &str,
+    kind: &str,
+    (sender, aliases): (&str, &[String]),
+    name: Option<&str>,
+) -> Result<Attachment> {
+    let resource = if kind == "image" { "image" } else { "file" };
+    let bytes = incoming
         .lark
-        .download_resource(message_id, file_key, "file")
+        .download_resource(&m.message_id, key, resource)
         .await
-    {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(file_key, error = %e, "downloading Lark audio failed");
-            return None;
+        .context("downloading from Lark")?;
+    let (name, media_type) = match kind {
+        "image" => {
+            let (extension, media_type) =
+                image_type(&bytes).context("not a PNG, JPEG, GIF or WebP image")?;
+            (format!("image.{extension}"), media_type.to_string())
         }
+        "audio" => (VOICE_NAME.to_string(), "audio/ogg".to_string()),
+        "video" => (
+            name.unwrap_or("video.mp4").to_string(),
+            "video/mp4".to_string(),
+        ),
+        // The gateway takes its type from its name.
+        _ => (
+            name.unwrap_or("file").to_string(),
+            "application/octet-stream".to_string(),
+        ),
     };
-    let transcript = match whisper.transcribe(bytes, "voice.opus").await {
-        Ok(t) => t,
+    incoming
+        .gateway
+        .upload(sender, aliases, &name, &media_type, bytes)
+        .await
+}
+
+/// The extension and media type of an image Lark and the gateway both
+/// show, by its bytes.
+pub fn image_type(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(("png", "image/png"))
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some(("jpg", "image/jpeg"))
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some(("gif", "image/gif"))
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some(("webp", "image/webp"))
+    } else {
+        None
+    }
+}
+
+/// The text of a message that sent file `name`: `note`, and when the file
+/// could not be passed on, a line saying so, for the agent to tell the
+/// sender.
+fn file_message(
+    received: Result<Attachment>,
+    note: Option<&str>,
+    name: &str,
+    attachments: &mut Vec<Attachment>,
+) -> ChannelMessageContent {
+    let mut text = note.unwrap_or_default().to_string();
+    match received {
+        Ok(attachment) => attachments.push(attachment),
         Err(e) => {
-            warn!(file_key, error = %e, "whisper transcription failed");
-            return None;
+            warn!(name, error = %format!("{e:#}"), "could not pass a file on to havn");
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            // Only what went wrong, not the error itself.
+            let _ = write!(
+                text,
+                "[The sender sent a file, {name}, that could not be received: {}]",
+                failure(&e)
+            );
         }
-    };
-    Some(ChannelMessageContent::Audio {
-        transcript,
-        duration_seconds: duration_ms.map(|ms| u32::try_from(ms / 1000).unwrap_or(0)),
-        url: None,
-    })
+    }
+    ChannelMessageContent::Text { text }
+}
+
+/// What kept a file from the agent, for the message to say.
+fn failure(e: &anyhow::Error) -> &'static str {
+    let chain = format!("{e:#}");
+    // The gateway's reasons first: several share a status.
+    if chain.contains("inbox is full") {
+        "the agent's inbox is full"
+    } else if chain.contains("disk space") {
+        "the agent's host is out of disk space"
+    } else if chain.contains("in the last hour") {
+        "this sender sent too many files in the last hour"
+    } else if chain.contains("larger than") || chain.contains("over 25 MB") {
+        "it is larger than 25 MB"
+    } else if chain.contains("(403") {
+        "the agent does not take files from this sender"
+    } else if chain.contains("still running") {
+        "too many files at once; it can be sent again in a while"
+    } else if chain.contains("not a PNG") {
+        "it is an image of a kind the agent cannot see"
+    } else {
+        "it could not be downloaded from Lark or saved"
+    }
+}
+
+/// The reaction shown on each message whose reply is due, as a typing
+/// indicator: Lark's `Typing`, put on as the message goes to the gateway and
+/// taken off as its reply comes. The gateway does not say which reply
+/// answers which message, so a chat's messages are answered in turn, the
+/// oldest first; a part of a reply with more to come leaves it on. One that
+/// gets no reply goes after [`WORKING_FOR`].
+#[derive(Clone)]
+pub struct Working {
+    lark: Arc<LarkClient>,
+    chats: Arc<Mutex<HashMap<String, VecDeque<Shown>>>>,
+    next: Arc<AtomicU64>,
+}
+
+/// A message with the reaction on, or being put on.
+struct Shown {
+    id: u64,
+    /// The message the reaction is on.
+    message_id: String,
+    /// The message id its reply names in `in_reply_to`.
+    answered_by: String,
+    reaction: Option<String>,
+}
+
+const WORKING_EMOJI: &str = "Typing";
+const WORKING_FOR: std::time::Duration = std::time::Duration::from_mins(5);
+
+impl Working {
+    pub fn new(lark: Arc<LarkClient>) -> Self {
+        Self {
+            lark,
+            chats: Arc::default(),
+            next: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn chats(&self) -> std::sync::MutexGuard<'_, HashMap<String, VecDeque<Shown>>> {
+        self.chats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Message `message_id` came from `to` (the id replies go to): its reply
+    /// is due, named `answered_by` as its reply answers it.
+    pub fn start(&self, to: &str, message_id: &str, answered_by: &str) {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.chats()
+            .entry(to.to_string())
+            .or_default()
+            .push_back(Shown {
+                id,
+                message_id: message_id.to_string(),
+                answered_by: answered_by.to_string(),
+                reaction: None,
+            });
+        let this = self.clone();
+        let (to, message_id) = (to.to_string(), message_id.to_string());
+        tokio::spawn(async move {
+            match this.lark.add_reaction(&message_id, WORKING_EMOJI).await {
+                Ok(reaction) => {
+                    let gone = {
+                        let mut chats = this.chats();
+                        match chats
+                            .get_mut(&to)
+                            .and_then(|q| q.iter_mut().find(|s| s.id == id))
+                        {
+                            Some(shown) => {
+                                shown.reaction = Some(reaction.clone());
+                                false
+                            }
+                            None => true,
+                        }
+                    };
+                    // Replied to while it was being put on.
+                    if gone {
+                        this.take_off(&message_id, &reaction).await;
+                    }
+                }
+                Err(e) => {
+                    debug!(error = %format!("{e:#}"), "lark: could not show that a reply is due");
+                }
+            }
+            tokio::time::sleep(WORKING_FOR).await;
+            this.end(&to, |s| s.id == id);
+        });
+    }
+
+    /// A reply went to `to`, or one that ends a turn. The message it
+    /// answers (`in_reply_to`) loses its reaction, and one that answers a
+    /// message without one takes no other's. A reply that names none, as the
+    /// agent's in a private chat, takes it off the oldest there: the gateway
+    /// does not say which it answers, nor tell them from a scheduled report.
+    pub fn replied(&self, to: &str, in_reply_to: Option<&str>) {
+        match in_reply_to {
+            Some(answers) => self.end(to, |s| s.answered_by == answers),
+            None => self.end(to, |_| true),
+        }
+    }
+
+    fn end(&self, to: &str, which: impl Fn(&Shown) -> bool) {
+        let shown = {
+            let mut chats = self.chats();
+            let Some(queue) = chats.get_mut(to) else {
+                return;
+            };
+            let Some(at) = queue.iter().position(which) else {
+                return;
+            };
+            let shown = queue.remove(at);
+            if queue.is_empty() {
+                chats.remove(to);
+            }
+            shown
+        };
+        if let Some(Shown {
+            message_id,
+            reaction: Some(reaction),
+            ..
+        }) = shown
+        {
+            let this = self.clone();
+            tokio::spawn(async move { this.take_off(&message_id, &reaction).await });
+        }
+    }
+
+    async fn take_off(&self, message_id: &str, reaction: &str) {
+        if let Err(e) = self.lark.delete_reaction(message_id, reaction).await {
+            debug!(error = %format!("{e:#}"), "lark: could not take a reaction off");
+        }
+    }
+
+    /// The messages waiting for a reply to `to`.
+    #[cfg(test)]
+    fn waiting(&self, to: &str) -> Vec<String> {
+        self.chats()
+            .get(to)
+            .map(|q| q.iter().map(|s| s.message_id.clone()).collect())
+            .unwrap_or_default()
+    }
 }
 
 /// Extract plain text from a Lark `post` (rich text) content object.
@@ -759,10 +1289,16 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let lark = LarkClient::unauthenticated("http://127.0.0.1:9".into(), "a".into(), "s".into())
             .unwrap();
+        let delivered = Arc::new(Delivered::load(None, "bot"));
+        delivered.took_aliases();
         (
             Incoming {
-                lark,
-                whisper: None,
+                lark: lark.clone(),
+                gateway: Gateway::new("ws://127.0.0.1:9", "t", "lark", "bot").unwrap(),
+                delivered,
+                working: Working::new(lark),
+                cards: Arc::default(),
+                people: Arc::default(),
                 outbound_tx: tx,
                 account_id: "bot".into(),
                 seq: Arc::new(AtomicU64::new(1)),
@@ -828,6 +1364,225 @@ mod tests {
         assert_eq!(raw["header"]["event_id"], "e1");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err(), "no third inbound");
+    }
+
+    fn press_event(event_id: &str, open_id: &str, value: Value, form: Value) -> Value {
+        json!({
+            "schema": "2.0",
+            "header": {"event_id": event_id, "event_type": "card.action.trigger", "token": "",
+                       "create_time": "1700000000000000", "app_id": "a", "tenant_key": "t"},
+            "event": {
+                "operator": {"open_id": open_id, "union_id": format!("on_{open_id}"), "tenant_key": "t"},
+                "token": "c-1",
+                "action": {"tag": "button", "value": value, "form_value": form},
+                "host": "im_message",
+                "context": {"open_message_id": "om_card", "open_chat_id": "oc_1"}
+            }
+        })
+    }
+
+    async fn said(rx: &mut mpsc::Receiver<ChannelFrame>) -> ChannelInbound {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(ChannelFrame::Inbound(inb))) => inb,
+            other => panic!("expected an inbound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_press_goes_on_once_as_its_person_typed_it() {
+        let (incoming, mut rx) = incoming(None, None);
+        incoming
+            .cards
+            .lock()
+            .unwrap()
+            .note("om_card", "Approve the step?");
+        let value = json!({ "said": "/approve 7", "to": "lark:on_ou_a" });
+        // Someone it was not sent to: refused, nothing goes on.
+        let Taken::Answer(answer) =
+            incoming.take(press_event("p0", "ou_x", value.clone(), json!({})))
+        else {
+            panic!("a press is answered");
+        };
+        assert_eq!(answer["toast"]["type"], "error");
+        let Taken::Answer(answer) =
+            incoming.take(press_event("p1", "ou_a", value.clone(), json!({})))
+        else {
+            panic!("a press is answered");
+        };
+        // The card without its buttons.
+        assert_eq!(answer["card"]["type"], "raw");
+        let elements = answer["card"]["data"]["body"]["elements"]
+            .as_array()
+            .unwrap();
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0]["content"], "Approve the step?");
+        let inb = said(&mut rx).await;
+        assert_eq!(inb.sender_id, "lark:on_ou_a");
+        assert_eq!(inb.sender_aliases, ["lark:ou_a"]);
+        // Its reply goes to the person, not as a reply to the card.
+        assert_eq!(inb.channel_message_id, "press:om_card");
+        let raw = inb.raw.as_ref().unwrap();
+        assert!(
+            raw["event"].get("token").is_none()
+                && raw["event"]["operator"].get("tenant_key").is_none()
+        );
+        assert_eq!(
+            inb.content,
+            ChannelMessageContent::Text {
+                text: "/approve 7".into()
+            }
+        );
+        // Pressed again: once only.
+        let Taken::Answer(answer) = incoming.take(press_event("p2", "ou_a", value, json!({})))
+        else {
+            panic!("a press is answered");
+        };
+        assert_eq!(answer["toast"]["type"], "info");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_card_pressed_outside_the_person_s_private_chat_is_not_taken() {
+        let (incoming, mut rx) = incoming(None, None);
+        // A message shows their private chat, oc_1.
+        assert_eq!(incoming.take(message_event("m1", "om_m1", "")), Taken::Done);
+        let _ = said(&mut rx).await;
+        let value = json!({ "said": "/approve 7", "to": "lark:on_b" });
+        // A copy of the card, which the daemon does not know, forwarded into
+        // a group and pressed there.
+        let mut forwarded = press_event("p1", "ou_a", value, json!({}));
+        forwarded["event"]["operator"]["union_id"] = json!("on_b");
+        forwarded["event"]["context"]["open_message_id"] = json!("om_copy");
+        forwarded["event"]["context"]["open_chat_id"] = json!("oc_group");
+        let Taken::Answer(answer) = incoming.take(forwarded) else {
+            panic!("answered");
+        };
+        assert_eq!(answer["toast"]["type"], "error");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err(), "nothing goes on");
+        assert!(!incoming.cards.lock().unwrap().was_pressed("om_copy"));
+    }
+
+    #[tokio::test]
+    async fn a_question_sends_back_its_answer_and_the_numbers_chosen() {
+        let (incoming, mut rx) = incoming(None, None);
+        let value = json!({ "kind": "question", "answer": "/answer q1", "to": "lark:on_ou_a" });
+        let Taken::Answer(answer) = incoming.take(press_event(
+            "q0",
+            "ou_a",
+            value.clone(),
+            json!({ "choices": [] }),
+        )) else {
+            panic!("answered");
+        };
+        assert_eq!(answer["toast"]["type"], "warning");
+        let Taken::Answer(answer) = incoming.take(press_event(
+            "q1",
+            "ou_a",
+            value.clone(),
+            json!({ "choices": ["1", "3"] }),
+        )) else {
+            panic!("answered");
+        };
+        assert_eq!(
+            answer["toast"]["type"], "error",
+            "a card it does not know, pressed where it does not know the person's chat"
+        );
+        // A message of theirs shows their private chat with the bot, oc_1:
+        // a card it does not know (sent before a restart) is taken there.
+        assert_eq!(incoming.take(message_event("m1", "om_m1", "")), Taken::Done);
+        let _ = said(&mut rx).await;
+        let mut theirs = press_event(
+            "q2",
+            "ou_a",
+            value.clone(),
+            json!({ "choices": ["1", "3"] }),
+        );
+        theirs["event"]["operator"]["union_id"] = json!("on_b");
+        theirs["event"]["operator"]["open_id"] = json!("ou_a");
+        let value = json!({ "kind": "question", "answer": "/answer q1", "to": "lark:on_b" });
+        theirs["event"]["action"]["value"] = value.clone();
+        let Taken::Answer(answer) = incoming.take(theirs) else {
+            panic!("answered");
+        };
+        assert_eq!(
+            answer,
+            json!({}),
+            "a card it does not know is left as it is"
+        );
+        let inb = said(&mut rx).await;
+        assert_eq!(
+            inb.content,
+            ChannelMessageContent::Text {
+                text: "/answer q1 1,3".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_item_of_the_bot_s_menu_goes_on_as_its_command() {
+        let (incoming, mut rx) = incoming(None, None);
+        let event = json!({
+            "schema": "2.0",
+            "header": {"event_id": "m1", "event_type": "application.bot.menu_v6", "token": "",
+                       "create_time": "1700000000000", "app_id": "a", "tenant_key": "t"},
+            "event": {"operator": {"operator_name": "A", "operator_id": {"open_id": "ou_a", "union_id": "on_a"}},
+                      "event_key": "new", "timestamp": 1_700_000_000}
+        });
+        assert_eq!(incoming.take(event), Taken::Done);
+        let inb = said(&mut rx).await;
+        assert_eq!(
+            inb.content,
+            ChannelMessageContent::Text {
+                text: "/new".into()
+            }
+        );
+        assert_eq!(inb.channel_message_id, "menu:m1");
+        assert_eq!(inb.sender_id, "lark:on_a");
+        assert!(inb.raw.unwrap()["header"].get("tenant_key").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_reply_takes_the_reaction_off_its_chat_s_oldest_message() {
+        let (incoming, _rx) = incoming(None, None);
+        let working = &incoming.working;
+        working.start("lark:on_a", "om_1", "om_1");
+        working.start("lark:on_a", "om_2", "om_2");
+        working.start("lark:on_a", "om_card", "press:om_card");
+        working.start("lark:on_b", "om_3", "om_3");
+        assert_eq!(working.waiting("lark:on_a"), ["om_1", "om_2", "om_card"]);
+        // The reply to a press takes the card's off, and only that.
+        working.replied("lark:on_a", Some("press:om_card"));
+        assert_eq!(working.waiting("lark:on_a"), ["om_1", "om_2"]);
+        // A reply to a message with none, as an item of the menu, takes none.
+        working.replied("lark:on_a", Some("menu:ev_1"));
+        assert_eq!(working.waiting("lark:on_a"), ["om_1", "om_2"]);
+        working.replied("lark:on_a", Some("om_2"));
+        assert_eq!(working.waiting("lark:on_a"), ["om_1"]);
+        // One that names none: the oldest.
+        working.replied("lark:on_a", None);
+        working.replied("lark:on_a", None);
+        assert_eq!(working.waiting("lark:on_a"), Vec::<String>::new());
+        assert_eq!(working.waiting("lark:on_b"), ["om_3"]);
+    }
+
+    #[test]
+    fn images_are_told_by_their_bytes() {
+        assert_eq!(
+            image_type(b"\x89PNG\r\n\x1a\nrest"),
+            Some(("png", "image/png"))
+        );
+        assert_eq!(
+            image_type(&[0xff, 0xd8, 0xff, 0xe0]),
+            Some(("jpg", "image/jpeg"))
+        );
+        assert_eq!(image_type(b"GIF89a.."), Some(("gif", "image/gif")));
+        assert_eq!(
+            image_type(b"RIFF\0\0\0\0WEBPVP8 "),
+            Some(("webp", "image/webp"))
+        );
+        assert_eq!(image_type(b"%PDF-1.7"), None);
     }
 
     #[tokio::test]
