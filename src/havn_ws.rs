@@ -6,11 +6,17 @@
 //! - upgrade with `X-Adapter-Token` header
 //! - send `ChannelFrame::Inbound` on user message arrival
 //! - receive `ChannelFrame::Outbound` to forward to the platform
-//! - send `ChannelFrame::Resume{since_seq}` on reconnect (until
-//!   havn's Layer D2 ships, gateway warn-drops these — the adapter
-//!   should accept that data is lost across reconnects)
+//! - resume on every connect from the last outbound seq got (`since` in the
+//!   upgrade; across a restart, the last delivered, kept on disk, see
+//!   [`Delivered`]): the gateway replays the replies it kept (5 minutes)
+//!   that came after it, before any new one
 //! - heartbeat via `ChannelFrame::Ping` / `Pong`
+//! - the gateway's first frame, `ChannelFrame::Commands`, says whether it
+//!   takes a sender's aliases (havn issue #262): until it does, an inbound
+//!   goes with the id an older gateway knows its sender by
 
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
@@ -34,17 +40,223 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// Outbound queue capacity from the daemon → WS. Generous because
 /// individual frames are small and the bottleneck is the WS write.
 const OUTBOUND_CAPACITY: usize = 128;
-/// Inbound queue capacity from WS → daemon. The Telegram-side
+/// Inbound queue capacity from WS → daemon. The Lark-side
 /// outbound dispatcher is the consumer; if it falls behind the WS
 /// task applies backpressure naturally.
 const INBOUND_CAPACITY: usize = 128;
 
-#[derive(Debug, Clone)]
+/// How long a connection waits for the gateway's first frame, the command
+/// menu, before it sends anything: a gateway that sends none is older.
+const FIRST_FRAME_WAIT: Duration = Duration::from_secs(5);
+
+#[derive(Clone)]
 pub struct WsConfig {
     pub gateway_url: String,
     pub adapter_token: String,
     pub channel_id: String,
     pub account_id: String,
+    pub delivered: Arc<Delivered>,
+}
+
+// The token is not shown.
+impl std::fmt::Debug for WsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsConfig")
+            .field("gateway_url", &self.gateway_url)
+            .field("channel_id", &self.channel_id)
+            .field("account_id", &self.account_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where the daemon is in the gateway's numbering of its replies, as
+/// havn-channel-telegram keeps it: the last one it got, to resume from
+/// when it reconnects, and where a restart resumes from, kept in a file.
+/// Replies are delivered by the worker of their chat, so a later one may
+/// be delivered before an earlier one of a slower chat: the file keeps the
+/// last seq up to which every reply was delivered, and those after it that
+/// were, which a restart does not deliver again (havn issue #325).
+#[derive(Debug)]
+pub struct Delivered {
+    path: Option<PathBuf>,
+    account_id: String,
+    got: Mutex<Option<u64>>,
+    marks: Mutex<Marks>,
+    /// A write that failed is said once.
+    warned: std::sync::atomic::AtomicBool,
+}
+
+/// What [`Delivered`] knows of the replies it was handed.
+#[derive(Debug, Default)]
+struct Marks {
+    /// Every reply up to it was delivered.
+    upto: Option<u64>,
+    /// Handed to a chat's worker, not delivered yet.
+    waiting: std::collections::BTreeSet<u64>,
+    /// Delivered, past `upto`.
+    done: std::collections::BTreeSet<u64>,
+}
+
+/// Replies past the last seq up to which all were delivered that are kept
+/// as delivered at most; past that, the oldest are let go (a restart would
+/// deliver them again).
+const DONE_KEPT: usize = 1024;
+
+/// What the file holds.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Kept {
+    account_id: String,
+    seq: u64,
+    /// Replies past `seq` that were delivered. Absent from a file of an
+    /// older daemon.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    done: Vec<u64>,
+}
+
+impl Delivered {
+    /// The last seq kept at `path` for `account_id`, if any: none for a
+    /// file of another account, or none at all (the first run).
+    pub fn load(path: Option<PathBuf>, account_id: &str) -> Self {
+        let kept = path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str::<Kept>(&s).ok())
+            .filter(|k| k.account_id == account_id);
+        let marks = Marks {
+            upto: kept.as_ref().map(|k| k.seq),
+            waiting: std::collections::BTreeSet::new(),
+            done: kept
+                .as_ref()
+                .map(|k| k.done.iter().copied().filter(|s| *s > k.seq).collect())
+                .unwrap_or_default(),
+        };
+        Self {
+            path,
+            account_id: account_id.to_string(),
+            got: Mutex::new(kept.map(|k| k.seq)),
+            marks: Mutex::new(marks),
+            warned: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The file of `account_id` in `dir`.
+    pub fn file_in(dir: &std::path::Path, account_id: &str) -> PathBuf {
+        let name: String = account_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        dir.join(format!("{name}.state.json"))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<u64>> {
+        self.got
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn marks(&self) -> std::sync::MutexGuard<'_, Marks> {
+        self.marks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Where to resume from on connecting: the last reply got, none on the
+    /// first run, which has nothing to resume (resuming from 0 would send
+    /// again every reply of the last 5 minutes).
+    pub fn since(&self) -> Option<u64> {
+        *self.lock()
+    }
+
+    /// The reply numbered `seq` came from the gateway. The gateway sends a
+    /// connection's replies in order and replays only those after the one
+    /// it resumes from, so one at or before the last got means it numbers
+    /// from somewhere else now (a gateway that counts from 1 restarted, or
+    /// its clock went back): taken all the same, from there on.
+    pub fn got(&self, seq: u64) {
+        let mut got = self.lock();
+        if let Some(last) = *got
+            && seq <= last
+        {
+            warn!(
+                seq,
+                last,
+                "the gateway numbers its replies from an earlier point now (it restarted, or \
+                 its clock went back); delivering them"
+            );
+        }
+        *got = Some(seq);
+    }
+
+    /// Whether the reply numbered `seq` was delivered already, before a
+    /// restart: one the gateway replays as it resumes from an earlier one,
+    /// not to be delivered again.
+    pub fn delivered_already(&self, seq: u64) -> bool {
+        self.marks().done.contains(&seq)
+    }
+
+    /// The reply numbered `seq` was handed to its chat's worker.
+    pub fn handed(&self, seq: u64) {
+        self.marks().waiting.insert(seq);
+    }
+
+    /// The reply numbered `seq` was delivered: kept, the file replaced
+    /// whole so a crash leaves the old one or the new one.
+    pub fn mark(&self, seq: u64) {
+        let kept = {
+            let mut marks = self.marks();
+            marks.waiting.remove(&seq);
+            marks.done.insert(seq);
+            let last_done = marks.done.last().copied().unwrap_or(seq);
+            let upto = match marks.waiting.first() {
+                Some(first) => first.saturating_sub(1),
+                None => last_done,
+            };
+            // A gateway that numbers from an earlier point is followed, as
+            // `got` does.
+            let upto = match marks.upto {
+                Some(old) if upto < old && !marks.waiting.is_empty() => old,
+                _ => upto,
+            };
+            marks.upto = Some(upto);
+            marks.done.retain(|s| *s > upto);
+            while marks.done.len() > DONE_KEPT {
+                marks.done.pop_first();
+            }
+            Kept {
+                account_id: self.account_id.clone(),
+                seq: upto,
+                done: marks.done.iter().copied().collect(),
+            }
+        };
+        let Some(path) = &self.path else {
+            return;
+        };
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        let written = serde_json::to_string(&kept)
+            .map_err(std::io::Error::other)
+            .and_then(|body| {
+                std::fs::write(&tmp, body)?;
+                std::fs::rename(&tmp, path)
+            });
+        if let Err(e) = written
+            && !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "could not keep the last reply delivered; a restart will not resume from it \
+                 (set StateDirectory= in the unit, or --state)"
+            );
+        }
+    }
 }
 
 /// Handle held by the daemon to push frames into the WS and read
@@ -52,7 +264,7 @@ pub struct WsConfig {
 /// internally it loops over `connect → run → backoff → reconnect`.
 pub struct WsClient {
     /// Daemon → WS. Send `ChannelFrame::Inbound` (and the rare
-    /// `Resume` / `Ping`) here.
+    /// `Ping`) here.
     pub outbound_tx: mpsc::Sender<ChannelFrame>,
     /// WS → daemon. Receive `ChannelFrame::Outbound` (and rare
     /// `Pong`) here.
@@ -91,10 +303,12 @@ async fn connection_loop(
                     gateway = %cfg.gateway_url,
                     channel = %cfg.channel_id,
                     account = %cfg.account_id,
+                    since = ?cfg.delivered.since(),
                     "havn WS connected"
                 );
                 backoff = RECONNECT_BACKOFF_MIN;
-                let outcome = run_session(ws, &mut outbound_rx, &inbound_tx).await;
+
+                let outcome = run_session(ws, &mut outbound_rx, &inbound_tx, &cfg.delivered).await;
                 match outcome {
                     SessionEnd::OutboundClosed => {
                         info!("havn WS: outbound channel closed; daemon shutting down");
@@ -127,6 +341,12 @@ async fn connect(cfg: &WsConfig) -> Result<WebSocketStream<MaybeTlsStream<TcpStr
         .clear()
         .append_pair("channel", &cfg.channel_id)
         .append_pair("account", &cfg.account_id);
+    // The replies kept for it while it was away come first, before any new
+    // one: the gateway starts the replay as it registers the connection.
+    if let Some(since) = cfg.delivered.since() {
+        url.query_pairs_mut()
+            .append_pair("since", &since.to_string());
+    }
 
     let mut req = url
         .as_str()
@@ -156,8 +376,25 @@ async fn run_session(
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     outbound_rx: &mut mpsc::Receiver<ChannelFrame>,
     inbound_tx: &mpsc::Sender<ChannelFrame>,
+    delivered: &Delivered,
 ) -> SessionEnd {
     let (mut sink, mut stream) = ws.split();
+    // Nothing is sent before the gateway's first frame, which says whether
+    // it takes a sender's aliases; one that sends none in time is older.
+    let mut aliases = false;
+    match tokio::time::timeout(FIRST_FRAME_WAIT, stream.next()).await {
+        Ok(Some(Ok(msg))) => match pass_on(msg, inbound_tx, delivered).await {
+            Passed::On(taken) => aliases = taken,
+            Passed::Closed => return SessionEnd::WsClosed,
+            Passed::Gone => return SessionEnd::OutboundClosed,
+        },
+        Ok(Some(Err(e))) => return SessionEnd::WsError(e),
+        Ok(None) => return SessionEnd::WsClosed,
+        Err(_) => {}
+    }
+    if !aliases {
+        info!("havn WS: the gateway does not take sender aliases; senders go by their open_id");
+    }
     loop {
         tokio::select! {
             // Outbound: daemon → WS
@@ -167,7 +404,7 @@ async fn run_session(
                     let _ = sink.send(Message::Close(None)).await;
                     return SessionEnd::OutboundClosed;
                 };
-                let s = match serde_json::to_string(&frame) {
+                let s = match serde_json::to_string(&for_gateway(frame, aliases)) {
                     Ok(s) => s,
                     Err(e) => {
                         warn!(error = %e, "havn WS: serialize ChannelFrame failed; skipping");
@@ -185,27 +422,215 @@ async fn run_session(
                     Some(Err(e)) => return SessionEnd::WsError(e),
                     None => return SessionEnd::WsClosed,
                 };
-                match msg {
-                    Message::Text(t) => {
-                        let parsed: ChannelFrame = match serde_json::from_str(&t) {
-                            Ok(f) => f,
-                            Err(e) => {
-                                warn!(error = %e, "havn WS: malformed frame; skipping");
-                                continue;
-                            }
-                        };
-                        // If the daemon's consumer is gone, EOF the
-                        // session — shutdown is in progress.
-                        if inbound_tx.send(parsed).await.is_err() {
-                            return SessionEnd::OutboundClosed;
-                        }
-                    }
-                    Message::Close(_) => return SessionEnd::WsClosed,
-                    // Control frames — tungstenite auto-responds to
-                    // protocol-level Pings; we don't need to.
-                    Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {}
+                match pass_on(msg, inbound_tx, delivered).await {
+                    Passed::On(_) => {}
+                    Passed::Closed => return SessionEnd::WsClosed,
+                    Passed::Gone => return SessionEnd::OutboundClosed,
                 }
             }
         }
+    }
+}
+
+/// What became of a message from the gateway.
+enum Passed {
+    /// Passed on to the daemon, or skipped: whether it was the command menu
+    /// of a gateway that takes a sender's aliases.
+    On(bool),
+    /// The gateway closed the connection.
+    Closed,
+    /// The daemon's consumer is gone: shutdown is in progress.
+    Gone,
+}
+
+async fn pass_on(
+    msg: Message,
+    inbound_tx: &mpsc::Sender<ChannelFrame>,
+    delivered: &Delivered,
+) -> Passed {
+    match msg {
+        Message::Text(t) => {
+            let parsed: ChannelFrame = match serde_json::from_str(&t) {
+                Ok(f) => f,
+                Err(e) => {
+                    warn!(error = %e, "havn WS: malformed frame; skipping");
+                    return Passed::On(false);
+                }
+            };
+            if let ChannelFrame::Outbound(o) = &parsed {
+                delivered.got(o.seq);
+            }
+            let aliases = matches!(&parsed, ChannelFrame::Commands(c) if c.sender_aliases);
+            if inbound_tx.send(parsed).await.is_err() {
+                return Passed::Gone;
+            }
+            Passed::On(aliases)
+        }
+        Message::Close(_) => Passed::Closed,
+        // Control frames — tungstenite auto-responds to protocol-level
+        // Pings; we don't need to.
+        Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {
+            Passed::On(false)
+        }
+    }
+}
+
+/// `frame` as the gateway takes it: to one that does not take a sender's
+/// aliases (havn issue #262), an inbound goes with the first of them, the
+/// id that gateway knows the sender by.
+fn for_gateway(frame: ChannelFrame, aliases: bool) -> ChannelFrame {
+    match frame {
+        ChannelFrame::Inbound(mut inb) if !aliases && !inb.sender_aliases.is_empty() => {
+            inb.sender_id = inb.sender_aliases.remove(0);
+            inb.sender_aliases.clear();
+            ChannelFrame::Inbound(inb)
+        }
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    fn dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("havn-lark-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn inbound(sender_id: &str, aliases: &[&str]) -> ChannelFrame {
+        ChannelFrame::Inbound(crate::types::ChannelInbound {
+            seq: 1,
+            account_id: "bot".into(),
+            channel_message_id: "om_1".into(),
+            sender_id: sender_id.into(),
+            content: crate::types::ChannelMessageContent::Text { text: "hi".into() },
+            timestamp: chrono::Utc::now(),
+            raw: None,
+            sender_aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
+        })
+    }
+
+    fn sender(frame: &ChannelFrame) -> (String, Vec<String>) {
+        match frame {
+            ChannelFrame::Inbound(inb) => (inb.sender_id.clone(), inb.sender_aliases.clone()),
+            _ => panic!("not an inbound"),
+        }
+    }
+
+    #[test]
+    fn a_gateway_that_takes_no_aliases_gets_the_id_it_knows() {
+        let frame = inbound("lark:on_u", &["lark:ou_o"]);
+        assert_eq!(
+            sender(&for_gateway(frame.clone(), true)),
+            ("lark:on_u".into(), vec!["lark:ou_o".into()])
+        );
+        assert_eq!(
+            sender(&for_gateway(frame, false)),
+            ("lark:ou_o".into(), Vec::new())
+        );
+        // A sender with no alias goes as it is.
+        assert_eq!(
+            sender(&for_gateway(inbound("lark:ou_o", &[]), false)),
+            ("lark:ou_o".into(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn the_first_run_resumes_from_nothing() {
+        let d = dir("first");
+        let delivered = Delivered::load(Some(Delivered::file_in(&d, "bot")), "bot");
+        assert_eq!(delivered.since(), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_restart_resumes_from_the_last_delivered() {
+        let d = dir("restart");
+        let path = Delivered::file_in(&d, "bot");
+        let delivered = Delivered::load(Some(path.clone()), "bot");
+        for seq in [41, 42, 43] {
+            delivered.got(seq);
+        }
+        delivered.mark(41);
+        delivered.mark(42);
+        // A reconnect resumes from the last got: 43 is waiting to go out.
+        assert_eq!(delivered.since(), Some(43));
+        // A restart, from the last delivered: 43 was lost with the process.
+        let again = Delivered::load(Some(path.clone()), "bot");
+        assert_eq!(again.since(), Some(42));
+        // A file of another account is not this one's.
+        assert_eq!(Delivered::load(Some(path), "other").since(), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_gateway_numbering_from_earlier_is_followed() {
+        let d = dir("earlier");
+        let path = Delivered::file_in(&d, "bot");
+        let delivered = Delivered::load(Some(path.clone()), "bot");
+        delivered.got(500);
+        delivered.mark(500);
+        // A gateway counting from 1 restarted.
+        delivered.got(1);
+        delivered.mark(1);
+        assert_eq!(delivered.since(), Some(1));
+        assert_eq!(Delivered::load(Some(path), "bot").since(), Some(1));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_reply_of_a_slower_chat_is_resumed_from_and_those_after_it_are_not_sent_again() {
+        let d = dir("chats");
+        let path = Delivered::file_in(&d, "bot");
+        let delivered = Delivered::load(Some(path.clone()), "bot");
+        for seq in [10, 11, 12] {
+            delivered.got(seq);
+            delivered.handed(seq);
+        }
+        // 10 waits in a slow chat while 11 and 12 go in others.
+        delivered.mark(11);
+        delivered.mark(12);
+        let again = Delivered::load(Some(path.clone()), "bot");
+        assert_eq!(again.since(), Some(9), "10 is sent again after a restart");
+        assert!(!again.delivered_already(10));
+        assert!(again.delivered_already(11) && again.delivered_already(12));
+        delivered.mark(10);
+        let again = Delivered::load(Some(path), "bot");
+        assert_eq!(again.since(), Some(12));
+        assert!(!again.delivered_already(11), "nothing past it to skip");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn accounts_keep_files_of_their_own() {
+        let d = dir("accounts");
+        assert_ne!(Delivered::file_in(&d, "a/b"), Delivered::file_in(&d, "c"));
+        assert_eq!(
+            Delivered::file_in(&d, "../x").file_name().unwrap(),
+            "___x.state.json"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_written_keeps_the_seqs_in_memory() {
+        let delivered = Delivered::load(
+            Some(PathBuf::from("/nonexistent/dir/bot.state.json")),
+            "bot",
+        );
+        delivered.got(5);
+        delivered.mark(5);
+        delivered.mark(6);
+        assert_eq!(delivered.since(), Some(5));
+        let d = dir("garbled");
+        let garbled = d.join("bot.state.json");
+        std::fs::write(&garbled, "not json").unwrap();
+        assert_eq!(Delivered::load(Some(garbled), "bot").since(), None);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

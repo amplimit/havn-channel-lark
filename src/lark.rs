@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 
 /// Refresh the token this long before its stated expiry (default 7200s),
 /// leaving a safety margin so an in-flight request never races expiry.
-const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(30 * 60);
+const TOKEN_REFRESH_MARGIN: Duration = Duration::from_mins(30);
 /// On a refresh failure, retry this soon rather than waiting a full cycle.
 const TOKEN_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -44,23 +44,32 @@ impl LarkClient {
         app_id: String,
         app_secret: String,
     ) -> Result<(Arc<Self>, u64)> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .context("building Lark HTTP client")?;
-        let client = Arc::new(Self {
-            http,
-            base_url: base_url.trim_end_matches('/').to_string(),
-            app_id,
-            app_secret,
-            token: RwLock::new(String::new()),
-        });
+        let client = Self::unauthenticated(base_url, app_id, app_secret)?;
         let expire = client
             .refresh_token()
             .await
             .context("initial tenant_access_token")?;
         info!(expire_s = expire, "Lark tenant_access_token acquired");
         Ok((client, expire))
+    }
+
+    /// The client before it has a token.
+    pub fn unauthenticated(
+        base_url: String,
+        app_id: String,
+        app_secret: String,
+    ) -> Result<Arc<Self>> {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .context("building Lark HTTP client")?;
+        Ok(Arc::new(Self {
+            http,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            app_id,
+            app_secret,
+            token: RwLock::new(String::new()),
+        }))
     }
 
     /// Download arbitrary bytes from a URL (no Lark auth) — used to fetch an
@@ -375,7 +384,12 @@ pub struct EventEnvelope {
 
 #[derive(Debug, Deserialize)]
 pub struct EventHeader {
+    /// The same for each time Lark sends the event again.
+    #[serde(default)]
+    pub event_id: String,
     pub event_type: String,
+    /// The app's Verification Token.
+    #[serde(default)]
     pub token: String,
 }
 
@@ -391,9 +405,15 @@ pub struct Sender {
     pub sender_id: SenderId,
 }
 
+/// The sender's ids (havn issue #262): `open_id` is the person in this
+/// app only; `union_id` the same person in every app of the same
+/// developer, which for an app made in a tenant (a custom app) is every
+/// custom app of the tenant.
 #[derive(Debug, Deserialize)]
 pub struct SenderId {
     pub open_id: String,
+    #[serde(default)]
+    pub union_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

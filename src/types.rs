@@ -20,6 +20,31 @@ pub enum ChannelFrame {
     Resume(ChannelResume),
     Ping,
     Pong,
+    /// Gateway -> adapter, the first frame on a connection: the chat
+    /// commands the gateway answers, and what it takes.
+    Commands(ChannelCommands),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelCommands {
+    pub account_id: String,
+    pub commands: Vec<ChannelCommand>,
+    /// The gateway takes group messages (havn issue #263).
+    #[serde(default)]
+    pub groups: bool,
+    /// The gateway takes `sender_aliases` on an inbound (havn issue #262):
+    /// until one says so, a sender goes by the id an older gateway knows.
+    #[serde(default)]
+    pub sender_aliases: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelCommand {
+    /// Without the slash.
+    pub name: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +57,12 @@ pub struct ChannelInbound {
     pub timestamp: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<serde_json::Value>,
+    /// Other ids the same sender went by (havn issue #262): Lark's
+    /// per-app `open_id`, which the adapter gave before the `union_id` in
+    /// `sender_id`. The gateway moves what it kept under them to
+    /// `sender_id`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sender_aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

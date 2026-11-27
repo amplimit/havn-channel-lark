@@ -7,12 +7,22 @@ Sibling of [havn-channel-telegram](https://github.com/amplimit/havn-channel-tele
 ## How it works
 
 ```
-Lark user ──event webhook──▶ havn-channel-lark ──WS /api/v1/channel──▶ havn gateway ──▶ agent
-Lark user ◀──IM send/reply── havn-channel-lark ◀──WS outbound──────── havn gateway ◀──┘
+Lark user ──long connection (or webhook)──▶ havn-channel-lark ──WS /api/v1/channel──▶ havn gateway ──▶ agent
+Lark user ◀──IM send/reply──────────────── havn-channel-lark ◀──WS outbound──────── havn gateway ◀──┘
 ```
 
-- **Inbound** arrives over an HTTP **webhook** (`im.message.receive_v1`), the only inbound path this adapter implements: the daemon serves `POST /webhook` on `webhook_listen` (default `0.0.0.0:8090`), which you point Lark's "Request URL" at. It answers Lark's `url_verification` challenge, decrypts events when `encrypt_key` is set, and refuses events whose Verification Token does not match. The adapter opens no WebSocket long connection to Lark or Feishu: it gets only the events sent to its Request URL.
-- **Outbound** drains the gateway WS and calls Lark's IM send/reply API. A background task keeps the `tenant_access_token` fresh (Lark tokens expire every 2h).
+- **Inbound** comes, by default, over Lark's **long connection** (`events = "long_connection"`): the daemon opens a WebSocket to Lark (Feishu's 长连接, the event subscription Lark's own SDKs use) and gets the app's events on it, so it needs no public address, domain or certificate. It asks `<lark_base_url>/callback/ws/endpoint` for a fresh address each time it connects, pings as often as Lark asks (every 2 minutes unless Lark says otherwise), answers each event at once, and connects again whenever the connection drops or goes quiet for two pings: the first time after a random wait of up to 30 seconds (or what Lark says), then every 2 minutes (or what Lark says), without end. With `events = "webhook"`, Lark sends the events as HTTP requests instead: the daemon serves `POST /webhook` on `webhook_listen` (default `0.0.0.0:8090`), which you point Lark's "Request URL" at. It answers Lark's `url_verification` challenge and refuses events whose Verification Token does not match; with an Encrypt Key it decrypts them and refuses a request whose signature (`X-Lark-Signature`) does not match. Either way an encrypted event is decrypted with `encrypt_key`.
+- **Each event once.** Lark sends an event again when it got no answer in time; the daemon remembers the last 4096 events (`event_id`) and messages (`message_id`) it took and drops one it took before, so a retry makes no second turn. They are remembered while the daemon runs: an event Lark sends again across a restart of the daemon is taken again.
+- **Outbound** drains the gateway WS and calls Lark's IM send/reply API. A background task keeps the `tenant_access_token` fresh (Lark tokens expire every 2h). An empty end of a reply sends nothing.
+- **Replies missed while disconnected.** When the daemon reconnects to the gateway, after the gateway or the daemon restarted or the connection dropped, it gets the replies sent meanwhile that the gateway kept (the last 5 minutes), in order, before any new one. It keeps the last reply it delivered in `<account_id>.state.json` in the unit's `StateDirectory` (or next to the config file, or at `--state`), so a restart resumes too. Each chat's replies are delivered in order, by a worker of the chat's own, so a chat Lark is slow to take holds up no other; a restart resumes from the earliest reply not delivered yet, and does not deliver again those after it that were. A reply is delivered twice only if the daemon stops between sending it and keeping it.
+
+Lark (`https://open.larksuite.com`) and Feishu (`https://open.feishu.cn`) speak the same API, the long connection included; `lark_base_url` picks one.
+
+## Sender ids
+
+A sender is `lark:<union_id>`: the same person in every app of the same developer, which for apps made in your tenant (custom apps) is every custom app of the tenant. So a Lark account connected to a Havn account through one of your bots is that Havn user on all of them (see [Connecting a chat account](https://github.com/amplimit/Havn#connecting-a-chat-account)), and `allow_from` and `admins` take `lark:on_...` ids. A message from someone Lark gives no `union_id` for goes by their `open_id` (`lark:ou_...`), which is per app.
+
+Each message also names the sender's `open_id`, the id this adapter gave before, and a gateway of 0.2.17 or later moves what it kept under that id (their admission, connection and turned-away record) to the `union_id` with their first message; an `open_id` in `allow_from` admits the `union_id` (as an invite does), and one in `admins` still matches; the gateway's log says to replace them. Their chats from before stay with the agent under the old id: the next message starts a new chat. With an older gateway, senders go by their `open_id` as before, and links are per app.
 
 ## Setup
 
@@ -22,11 +32,9 @@ Lark user ◀──IM send/reply── havn-channel-lark ◀──WS outbound─
 2. **Permissions**: grant `im:message`, `im:message:send_as_bot` (send messages), and `im:resource` (download voice/files). Add a bot to the app.
 3. **Events & Callbacks**:
    - Subscribe to **`im.message.receive_v1`**.
-   - Set **Request URL** to `https://<your-public-host>/webhook` (reverse-proxy it to this daemon's `webhook_listen`).
-   - Copy the **Verification Token** and (recommended) set + copy an **Encrypt Key**.
+   - **Long connection** (the default): choose **Receive events through persistent connection** (使用长连接接收事件). Lark checks that a client is connected when you save it, so start the daemon first (step 3).
+   - **Webhook** (`events = "webhook"`): set **Request URL** to `https://<your-public-host>/webhook` (reverse-proxy it to this daemon's `webhook_listen`), and copy the **Verification Token** and (recommended) set and copy an **Encrypt Key**. The URL must be reachable from Lark's servers: put it behind your reverse proxy / TLS, the same way you front the havn gateway.
 4. Publish/enable the app for your tenant.
-
-> The webhook URL must be reachable from Lark's servers. Put it behind your reverse proxy / TLS, the same way you front the havn gateway.
 
 ### 2. havn side
 
@@ -62,6 +70,31 @@ cargo build --release
 ```
 
 The `adapter_token` in `config.toml` must equal the random string you gave `havn credential add`.
+
+Under systemd, give it a `StateDirectory`, where it keeps the last reply delivered:
+
+```ini
+# /etc/systemd/system/havn-channel-lark.service
+[Unit]
+Description=havn channel adapter for Lark / Feishu
+After=network.target havn.service
+Wants=havn.service
+
+[Service]
+ExecStart=/usr/local/bin/havn-channel-lark --config /etc/havn-channel-lark/config.toml
+Restart=always
+RestartSec=5
+User=havn-lark
+# Where it keeps the last reply delivered, to resume after a restart.
+StateDirectory=havn-channel-lark
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+```
 
 ## Content support (v1)
 
