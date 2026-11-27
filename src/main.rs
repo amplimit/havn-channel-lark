@@ -17,8 +17,9 @@
 //! card's button and an item of the bot's menu as what the person typed.
 //! Outbound: replies as cards ([`card`]) of the agent's Markdown, with the
 //! gateway's buttons and questions; files fetched from the gateway and sent
-//! as images or files, their captions after them; a `Typing` reaction on
-//! each message while its reply is due.
+//! as images or files, their captions after them; replies shown as they
+//! are written ([`live`]), in a card updated in place with a Stop button;
+//! a `Typing` reaction on each message while its reply is due.
 
 #![forbid(unsafe_code)]
 
@@ -28,6 +29,7 @@ mod events;
 mod gateway;
 mod havn_ws;
 mod lark;
+mod live;
 mod longconn;
 mod types;
 
@@ -240,6 +242,7 @@ async fn havn_outbound_loop(
     while let Some(frame) = inbound_rx.recv().await {
         match frame {
             ChannelFrame::Outbound(o) => chats.outbound(o),
+            ChannelFrame::Writing(w) => chats.writing(w),
             ChannelFrame::Commands(c) => {
                 if menu.as_ref() != Some(&c.commands) {
                     let keys: Vec<&str> = c.commands.iter().map(|c| c.name.as_str()).collect();
@@ -268,8 +271,6 @@ async fn havn_outbound_loop(
 /// A worker whose chat had nothing for this long ends; the next reply for
 /// its chat starts another.
 const CHAT_IDLE: Duration = Duration::from_secs(240);
-/// How often an idle worker looks whether it is to end.
-const CHAT_IDLE_EVERY: Duration = Duration::from_secs(30);
 
 /// Replies a chat's inbox holds at most, by number and by bytes. Past
 /// them, as when Lark keeps a chat behind what an agent sends it, the
@@ -278,18 +279,34 @@ const CHAT_IDLE_EVERY: Duration = Duration::from_secs(30);
 const CHAT_OUTBOUNDS: usize = 256;
 const CHAT_OUTBOUND_BYTES: usize = 8 * 1024 * 1024;
 
-/// What waits for a chat's worker, in the order it came.
+/// What a chat's worker is to do next.
+enum Job {
+    Writing(types::ChannelWriting),
+    Outbound(Box<ChannelOutbound>),
+}
+
+/// What waits for a chat's worker, numbered as it came: the replies, and,
+/// of each reply being written, only its latest frame (numbered as the
+/// first of its frames not taken yet, so it is taken in its place).
 #[derive(Default)]
 struct Pending {
-    outbounds: VecDeque<Box<ChannelOutbound>>,
+    next: u64,
+    outbounds: VecDeque<(u64, Box<ChannelOutbound>)>,
+    /// By reply and its part: the frames of a call after a part are not
+    /// taken in the place of those before it.
+    writings: HashMap<(String, u64), (u64, types::ChannelWriting)>,
+    /// The parts of each reply being written that wait.
+    parts: HashMap<String, u64>,
     /// The bytes of `outbounds`, about.
     bytes: usize,
     /// Replies were left out since the backlog began: said once.
     full: bool,
 }
 
-/// A chat's replies on their way to its worker. The router only adds to
-/// it, and never waits.
+/// A chat's frames on their way to its worker (havn issue #325). The router
+/// only adds to it, and never waits: replies wait in it up to
+/// [`CHAT_OUTBOUNDS`] and [`CHAT_OUTBOUND_BYTES`], and frames of replies
+/// being written take the place of their earlier ones.
 #[derive(Default)]
 struct Inbox {
     pending: Mutex<Pending>,
@@ -322,26 +339,76 @@ impl Inbox {
                 return false;
             }
             pending.bytes += size;
-            pending.outbounds.push_back(Box::new(o));
+            let n = pending.next;
+            pending.next += 1;
+            if let Some(reply) = &o.reply {
+                if o.partial {
+                    *pending.parts.entry(reply.clone()).or_default() += 1;
+                } else {
+                    pending.parts.remove(reply);
+                }
+            }
+            pending.outbounds.push_back((n, Box::new(o)));
         }
         self.added.notify_one();
         true
     }
 
-    fn take(&self) -> Option<Box<ChannelOutbound>> {
-        let mut pending = self.pending();
-        let o = pending.outbounds.pop_front()?;
-        let size = serde_json::to_vec(&o).map_or(0, |b| b.len());
-        pending.bytes = pending.bytes.saturating_sub(size);
-        if pending.outbounds.is_empty() {
-            pending.bytes = 0;
-            pending.full = false;
+    fn writing(&self, w: types::ChannelWriting) {
+        {
+            let mut pending = self.pending();
+            let n = pending.next;
+            pending.next += 1;
+            let key = (
+                w.reply.clone(),
+                pending.parts.get(&w.reply).copied().unwrap_or_default(),
+            );
+            match pending.writings.get_mut(&key) {
+                // Its latest, in the place of the first not taken; one that
+                // only says the reply is alive leaves text to show as it is.
+                Some((_, held)) => {
+                    if !w.alive || held.alive {
+                        *held = w;
+                    }
+                }
+                None => {
+                    pending.writings.insert(key, (n, w));
+                }
+            }
         }
-        Some(o)
+        self.added.notify_one();
+    }
+
+    /// What came first of what waits.
+    fn take(&self) -> Option<Job> {
+        let mut pending = self.pending();
+        let writing = pending
+            .writings
+            .iter()
+            .min_by_key(|(_, (n, _))| *n)
+            .map(|(key, (n, _))| (key.clone(), *n));
+        let outbound = pending.outbounds.front().map(|(n, _)| *n);
+        match (writing, outbound) {
+            (Some((key, w)), o) if o.is_none_or(|o| w < o) => {
+                pending.writings.remove(&key).map(|(_, w)| Job::Writing(w))
+            }
+            (_, Some(_)) => {
+                let (_, o) = pending.outbounds.pop_front()?;
+                let size = serde_json::to_vec(&o).map_or(0, |b| b.len());
+                pending.bytes = pending.bytes.saturating_sub(size);
+                if pending.outbounds.is_empty() {
+                    pending.bytes = 0;
+                    pending.full = false;
+                }
+                Some(Job::Outbound(o))
+            }
+            _ => None,
+        }
     }
 
     fn is_empty(&self) -> bool {
-        self.pending().outbounds.is_empty()
+        let pending = self.pending();
+        pending.outbounds.is_empty() && pending.writings.is_empty()
     }
 }
 
@@ -353,10 +420,12 @@ fn inboxes(all: &Inboxes) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Inbox
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Deliver the replies for chat `to`, in the order they come. A wait in
-/// one chat holds up no other, and a failure in one, a panic included,
-/// only that one. Each reply is marked delivered once it is. It ends, its
-/// inbox let go with it, when its chat had nothing for [`CHAT_IDLE`].
+/// Deliver what comes for chat `to`, in the order it comes (havn issue
+/// #325): replies, the replies being written and their ends, files and
+/// notices. A wait Lark asks for holds up this chat only, and a failure in
+/// one, a panic included, only that one. Each reply is marked delivered once
+/// it is. It ends, its inbox let go with it, when its chat had nothing for
+/// [`CHAT_IDLE`] and no reply is being written there.
 async fn chat_worker(
     out: Out,
     to: String,
@@ -365,15 +434,31 @@ async fn chat_worker(
     delivered: Arc<havn_ws::Delivered>,
 ) {
     use futures_util::FutureExt as _;
-    let mut idle = tokio::time::interval(CHAT_IDLE_EVERY);
+    let mut replies = live::Replies::default();
+    let mut idle = tokio::time::interval(live::LIVE_IDLE_EVERY);
     let mut last = tokio::time::Instant::now();
     loop {
-        let Some(o) = inbox.take() else {
+        let Some(job) = inbox.take() else {
+            let due = replies.due();
             tokio::select! {
                 biased;
                 () = inbox.added.notified() => {}
+                () = tokio::time::sleep_until(due.unwrap_or_else(tokio::time::Instant::now)), if due.is_some() => {
+                    let updated = std::panic::AssertUnwindSafe(replies.update_due(&out.lark))
+                        .catch_unwind()
+                        .await;
+                    if updated.is_err() {
+                        tracing::error!("lark: updating a reply being written panicked");
+                    }
+                }
                 _ = idle.tick() => {
-                    if last.elapsed() >= CHAT_IDLE {
+                    let finished = std::panic::AssertUnwindSafe(replies.idle(&out.lark))
+                        .catch_unwind()
+                        .await;
+                    if finished.is_err() {
+                        tracing::error!("lark: finishing an idle reply panicked");
+                    }
+                    if !replies.any() && last.elapsed() >= CHAT_IDLE {
                         // With the router's lock: it adds to this inbox, or
                         // starts another worker, not both.
                         let mut map = inboxes(&all);
@@ -388,26 +473,69 @@ async fn chat_worker(
             }
             continue;
         };
-        let sent = std::panic::AssertUnwindSafe(deliver_outbound(&out, &o))
-            .catch_unwind()
-            .await;
-        match sent {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                warn!(error = %format!("{e:#}"), seq = o.seq, "Lark delivery failed; dropping");
+        match job {
+            Job::Writing(w) => {
+                let taken = std::panic::AssertUnwindSafe(replies.writing(&out.lark, w))
+                    .catch_unwind()
+                    .await;
+                if taken.is_err() {
+                    tracing::error!("lark: showing a reply being written panicked");
+                }
             }
-            Err(_) => tracing::error!(
-                seq = o.seq,
-                "lark: delivering a reply panicked; dropping it"
-            ),
-        }
-        delivered.mark(o.seq);
-        // A reply came, or the end of one: a message waits on one fewer. A
-        // part of one has more to come.
-        if !o.partial {
-            out.working.replied(&o.to, o.in_reply_to.as_deref());
+            Job::Outbound(o) => {
+                let shown = std::panic::AssertUnwindSafe(replies.reply(&out.lark, &o))
+                    .catch_unwind()
+                    .await;
+                // A part of a reply being written, or its end, takes the
+                // place of what was shown; any other goes as it is, as does
+                // one whose showing failed.
+                if !matches!(shown, Ok(true)) {
+                    let sent = std::panic::AssertUnwindSafe(deliver_outbound(&out, &o))
+                        .catch_unwind()
+                        .await;
+                    match sent {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            warn!(error = %format!("{e:#}"), seq = o.seq, "Lark delivery failed; dropping");
+                        }
+                        Err(_) => tracing::error!(
+                            seq = o.seq,
+                            "lark: delivering a reply panicked; dropping it"
+                        ),
+                    }
+                }
+                delivered.mark(o.seq);
+                answered(&out.working, &o);
+            }
         }
         last = tokio::time::Instant::now();
+    }
+}
+
+/// A gateway gave a reply an id (havn issue #325): the ends of its turns
+/// can be told from what answers nothing.
+static REPLY_IDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What reply `o` answers loses its Typing reaction. One that names the
+/// message (`in_reply_to`) answers that one. The agent's in a private chat
+/// name none; the end of a turn (a reply with an id) answers the oldest
+/// there, and one without an id (a scheduled report, a notice) answers
+/// none, once the gateway gives ids; an older gateway gives none, and then
+/// any reply answers the oldest. A part of a reply has more to come.
+fn answered(working: &events::Working, o: &ChannelOutbound) {
+    if o.reply.is_some() {
+        REPLY_IDS.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if o.partial {
+        return;
+    }
+    match (o.in_reply_to.as_deref(), &o.reply) {
+        (Some(answers), _) => working.replied(&o.to, Some(answers)),
+        (None, Some(_)) => working.replied(&o.to, None),
+        (None, None) if !REPLY_IDS.load(std::sync::atomic::Ordering::Relaxed) => {
+            working.replied(&o.to, None);
+        }
+        (None, None) => {}
     }
 }
 
@@ -456,12 +584,31 @@ impl Chats {
             self.delivered.mark(seq);
         }
     }
+
+    /// Hand `w` to its chat's worker, in the place of the reply's earlier
+    /// frame it has not taken yet.
+    fn writing(&self, w: types::ChannelWriting) {
+        REPLY_IDS.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut map = inboxes(&self.inboxes);
+        let inbox = map.entry(w.to.clone()).or_insert_with(|| {
+            let inbox = Arc::new(Inbox::default());
+            tokio::spawn(chat_worker(
+                self.out.clone(),
+                w.to.clone(),
+                Arc::clone(&inbox),
+                Arc::clone(&self.inboxes),
+                Arc::clone(&self.delivered),
+            ));
+            inbox
+        });
+        inbox.writing(w);
+    }
 }
 
 /// Who an outbound `to` names, as Lark's `receive_id_type` and id: a
 /// sender's `union_id` (`on_`) or, from an older gateway or a reply kept
 /// from before, its `open_id` (`ou_`); a chat (`oc_`).
-fn recipient(to: &str) -> Option<(&'static str, &str)> {
+pub(crate) fn recipient(to: &str) -> Option<(&'static str, &str)> {
     let id = to.strip_prefix(events::PREFIX)?;
     let kind = if id.starts_with("on_") {
         "union_id"
@@ -751,6 +898,7 @@ mod tests {
             buttons: Vec::new(),
             poll: None,
             partial: false,
+            reply: None,
         }
     }
 
@@ -799,11 +947,81 @@ mod tests {
             assert!(inbox.outbound(outbound(seq, "lark:on_1", "x")));
         }
         assert!(!inbox.outbound(outbound(9999, "lark:on_1", "x")));
-        assert_eq!(inbox.take().map(|o| o.seq), Some(0));
-        assert_eq!(inbox.take().map(|o| o.seq), Some(1));
+        let seq = |job: Option<Job>| match job {
+            Some(Job::Outbound(o)) => Some(o.seq),
+            _ => None,
+        };
+        assert_eq!(seq(inbox.take()), Some(0));
+        assert_eq!(seq(inbox.take()), Some(1));
         while inbox.take().is_some() {}
         assert!(inbox.is_empty());
         assert!(!inbox.pending().full, "the backlog is over");
+    }
+
+    fn writing(reply: &str, text: &str, alive: bool) -> types::ChannelWriting {
+        types::ChannelWriting {
+            account_id: "bot".into(),
+            to: "lark:on_1".into(),
+            in_reply_to: None,
+            reply: reply.into(),
+            text: text.into(),
+            buttons: Vec::new(),
+            waiting: false,
+            alive,
+        }
+    }
+
+    #[test]
+    fn a_chat_inbox_keeps_the_order_and_only_the_latest_text_of_a_call() {
+        let inbox = Inbox::default();
+        inbox.writing(writing("r1", "He", false));
+        inbox.writing(writing("r1", "Hello", false));
+        // One that only says it is alive leaves the text to show.
+        inbox.writing(writing("r1", "", true));
+        let mut part = outbound(1, "lark:on_1", "Hello there");
+        part.reply = Some("r1".into());
+        part.partial = true;
+        assert!(inbox.outbound(part));
+        // After the part, the next call's frames are its own.
+        inbox.writing(writing("r1", "And", false));
+        match inbox.take() {
+            Some(Job::Writing(w)) => assert_eq!(w.text, "Hello"),
+            _ => panic!("the latest text first"),
+        }
+        assert!(matches!(inbox.take(), Some(Job::Outbound(o)) if o.partial));
+        match inbox.take() {
+            Some(Job::Writing(w)) => assert_eq!(w.text, "And"),
+            _ => panic!("the next call's text"),
+        }
+        assert!(inbox.take().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_reaction_comes_off_by_what_a_reply_answers() {
+        let out = out();
+        let working = &out.working;
+        for m in ["om_1", "om_2"] {
+            working.start("lark:on_1", m, m);
+        }
+        // A scheduled report, from a gateway that gives reply ids: none.
+        let mut end = outbound(1, "lark:on_1", "x");
+        end.reply = Some("r1".into());
+        let mut part = end.clone();
+        part.partial = true;
+        answered(working, &part);
+        answered(working, &outbound(2, "lark:on_1", "report"));
+        assert_eq!(
+            working.waiting("lark:on_1").len(),
+            2,
+            "a part and a report take none"
+        );
+        // The end of a turn: the oldest; a gateway notice: the one it names.
+        answered(working, &end);
+        assert_eq!(working.waiting("lark:on_1"), ["om_2"]);
+        let mut notice = outbound(3, "lark:on_1", "Connected");
+        notice.in_reply_to = Some("om_2".into());
+        answered(working, &notice);
+        assert_eq!(working.waiting("lark:on_1"), Vec::<String>::new());
     }
 
     #[tokio::test]
