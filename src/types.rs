@@ -63,6 +63,24 @@ pub struct ChannelInbound {
     /// `sender_id`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sender_aliases: Vec<String>,
+    /// Files the message carries, each first sent to the gateway's
+    /// `POST /api/v1/channel/files` (havn issue #106).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
+}
+
+/// A file saved in the agent's inbox, as the gateway answered its upload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Attachment {
+    pub path: String,
+    pub name: String,
+    pub media_type: String,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_path: Option<String>,
+    /// An audio file's transcript, when the gateway made one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +91,34 @@ pub struct ChannelOutbound {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<String>,
     pub content: ChannelMessageContent,
+    /// Rows of buttons under the message (havn issue #203): pressed, the
+    /// button's `data` goes back as what the person sent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buttons: Vec<Vec<Button>>,
+    /// A question of several answers (havn issue #204): a choice goes back
+    /// as `answer`, a space and the chosen options' numbers (from 1),
+    /// comma-separated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll: Option<Poll>,
+    /// A part of a reply with more to come (havn issue #212): the agent
+    /// is still working.
+    #[serde(default)]
+    pub partial: bool,
+}
+
+/// A question of several answers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Poll {
+    pub question: String,
+    pub options: Vec<String>,
+    pub answer: String,
+}
+
+/// A button under a message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Button {
+    pub label: String,
+    pub data: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,9 +139,14 @@ pub enum ChannelMessageContent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caption: Option<String>,
     },
+    /// Outbound, a file an agent sent: `url` is the gateway's
+    /// `/api/v1/channel/files/<agent>/<file>`, fetched with the adapter
+    /// token.
     File {
         url: String,
         filename: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
     },
     Audio {
         transcript: String,

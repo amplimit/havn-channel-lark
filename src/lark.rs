@@ -4,8 +4,9 @@
 //! Responsibilities:
 //! - Mint and proactively refresh a `tenant_access_token` from
 //!   `app_id` + `app_secret` (valid 7200s; we refresh well before).
-//! - Send / reply text + image + file messages via the IM v1 API.
-//! - Download message resources (`file_key`) for voice STT.
+//! - Send / reply messages (cards, text, images, files) via the IM v1 API,
+//!   and put a reaction on a message and take it off.
+//! - Download message resources (`file_key`) a sender sent.
 //! - Upload images/files for native outbound delivery.
 //!
 //! Also defines the inbound event structs (`im.message.receive_v1`).
@@ -37,6 +38,31 @@ const SLOW_DOWN_TRIES: u32 = 4;
 /// The longest wait for one try, whatever Lark asks: the chat waits, and
 /// no other.
 const SLOW_DOWN_FOR: Duration = Duration::from_secs(30);
+
+/// Lark answered a call and refused it: its code and message.
+#[derive(Debug)]
+pub struct Refused {
+    pub code: i64,
+    pub msg: String,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Lark refused it: code={} msg={}", self.code, self.msg)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// A message sent: its id, and the chat it went to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sent {
+    pub message_id: String,
+    pub chat_id: String,
+}
+
+/// The largest resource downloaded: the gateway takes no larger file.
+pub const MAX_DOWNLOAD_BYTES: usize = 25 * 1024 * 1024;
 
 pub struct LarkClient {
     http: reqwest::Client,
@@ -85,21 +111,6 @@ impl LarkClient {
         }))
     }
 
-    /// Download arbitrary bytes from a URL (no Lark auth) — used to fetch an
-    /// agent-supplied image/file URL before re-uploading it to Lark.
-    pub async fn fetch_url(&self, url: &str) -> Result<Vec<u8>> {
-        let resp = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .context("GET outbound url")?;
-        if !resp.status().is_success() {
-            bail!("fetch {url} -> HTTP {}", resp.status());
-        }
-        Ok(resp.bytes().await.context("read url bytes")?.to_vec())
-    }
-
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)
     }
@@ -143,14 +154,14 @@ impl LarkClient {
 
     /// Send a message to a recipient. `receive_id_type` is e.g. `open_id`
     /// or `chat_id`; `content` is the already-serialized JSON string Lark
-    /// expects (e.g. `{"text":"hi"}`). Returns the new `message_id`.
+    /// expects (e.g. `{"text":"hi"}`).
     pub async fn send_message(
         &self,
         receive_id_type: &str,
         receive_id: &str,
         msg_type: &str,
         content: &str,
-    ) -> Result<String> {
+    ) -> Result<Sent> {
         let body = json!({
             "receive_id": receive_id,
             "msg_type": msg_type,
@@ -164,13 +175,13 @@ impl LarkClient {
         self.send_message_req(req).await
     }
 
-    /// Reply to an existing message (threads under it). Returns the new id.
+    /// Reply to an existing message (threads under it).
     pub async fn reply_message(
         &self,
         message_id: &str,
         msg_type: &str,
         content: &str,
-    ) -> Result<String> {
+    ) -> Result<Sent> {
         let body = json!({ "msg_type": msg_type, "content": content });
         let req = self
             .http
@@ -182,7 +193,7 @@ impl LarkClient {
     /// Execute a send/reply request: the token refreshed once when Lark
     /// says it expired, and sent again after the wait Lark asks for when it
     /// says to slow down ([`slowed_down`]), up to [`SLOW_DOWN_TRIES`] times.
-    async fn send_message_req(&self, req: reqwest::RequestBuilder) -> Result<String> {
+    async fn send_message_req(&self, req: reqwest::RequestBuilder) -> Result<Sent> {
         #[derive(Deserialize)]
         struct SendResp {
             code: i64,
@@ -194,6 +205,8 @@ impl LarkClient {
         #[derive(Deserialize)]
         struct SendData {
             message_id: String,
+            #[serde(default)]
+            chat_id: String,
         }
         let mut refreshed = false;
         let mut slowed = 0u32;
@@ -247,24 +260,101 @@ impl LarkClient {
                 continue;
             }
             if parsed.code != 0 {
-                bail!("Lark send failed: code={} msg={}", parsed.code, parsed.msg);
+                return Err(Refused {
+                    code: parsed.code,
+                    msg: parsed.msg,
+                }
+                .into());
             }
             return parsed
                 .data
-                .map(|d| d.message_id)
+                .map(|d| Sent {
+                    message_id: d.message_id,
+                    chat_id: d.chat_id,
+                })
                 .context("send response missing message_id");
         }
     }
 
-    /// Download a message resource (`file_key`) — used for voice STT and
-    /// for inspecting inbound images/files. `kind` is `file` or `image`.
+    /// Put the reaction `emoji_type` (as `Typing`) on message
+    /// `message_id`: its id, to take it off with.
+    pub async fn add_reaction(&self, message_id: &str, emoji_type: &str) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Resp {
+            code: i64,
+            #[serde(default)]
+            msg: String,
+            #[serde(default)]
+            data: Option<Data>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            reaction_id: String,
+        }
+        let parsed: Resp = self
+            .http
+            .post(self.url(&format!("/open-apis/im/v1/messages/{message_id}/reactions")))
+            .header("Authorization", self.bearer().await)
+            .json(&json!({ "reaction_type": { "emoji_type": emoji_type } }))
+            .send()
+            .await
+            .context("POST message reaction")?
+            .json()
+            .await
+            .context("decode reaction response")?;
+        if parsed.code != 0 {
+            return Err(Refused {
+                code: parsed.code,
+                msg: parsed.msg,
+            }
+            .into());
+        }
+        parsed
+            .data
+            .map(|d| d.reaction_id)
+            .context("reaction response missing reaction_id")
+    }
+
+    /// Take the bot's reaction `reaction_id` off message `message_id`.
+    pub async fn delete_reaction(&self, message_id: &str, reaction_id: &str) -> Result<()> {
+        #[derive(Deserialize)]
+        struct Resp {
+            code: i64,
+            #[serde(default)]
+            msg: String,
+        }
+        let parsed: Resp = self
+            .http
+            .delete(self.url(&format!(
+                "/open-apis/im/v1/messages/{message_id}/reactions/{reaction_id}"
+            )))
+            .header("Authorization", self.bearer().await)
+            .send()
+            .await
+            .context("DELETE message reaction")?
+            .json()
+            .await
+            .context("decode reaction response")?;
+        if parsed.code != 0 {
+            return Err(Refused {
+                code: parsed.code,
+                msg: parsed.msg,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Download a message resource (`file_key`) a sender sent, at most
+    /// [`MAX_DOWNLOAD_BYTES`]. `kind` is `image` for an image, `file` for
+    /// any other (a file, audio, video).
     pub async fn download_resource(
         &self,
         message_id: &str,
         file_key: &str,
         kind: &str,
     ) -> Result<Vec<u8>> {
-        let resp = self
+        let mut resp = self
             .http
             .get(self.url(&format!(
                 "/open-apis/im/v1/messages/{message_id}/resources/{file_key}"
@@ -277,7 +367,17 @@ impl LarkClient {
         if !resp.status().is_success() {
             bail!("resource download HTTP {}", resp.status());
         }
-        Ok(resp.bytes().await.context("read resource bytes")?.to_vec())
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await.context("read resource bytes")? {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > MAX_DOWNLOAD_BYTES {
+                bail!(
+                    "the file is larger than {} MB",
+                    MAX_DOWNLOAD_BYTES / (1024 * 1024)
+                );
+            }
+        }
+        Ok(bytes)
     }
 
     /// Upload an image, returning its `image_key` for an outbound image
@@ -324,8 +424,14 @@ impl LarkClient {
             .context("image upload missing image_key")
     }
 
-    /// Upload a generic file, returning its `file_key`.
-    pub async fn upload_file(&self, bytes: Vec<u8>, file_name: &str) -> Result<String> {
+    /// Upload a file as Lark's `file_type` (`opus`, `mp4`, `pdf`, `doc`,
+    /// `xls`, `ppt`, or `stream` for any other), returning its `file_key`.
+    pub async fn upload_file(
+        &self,
+        bytes: Vec<u8>,
+        file_name: &str,
+        file_type: &str,
+    ) -> Result<String> {
         #[derive(Deserialize)]
         struct Resp {
             code: i64,
@@ -338,7 +444,7 @@ impl LarkClient {
             file_key: String,
         }
         let form = reqwest::multipart::Form::new()
-            .text("file_type", "stream")
+            .text("file_type", file_type.to_string())
             .text("file_name", file_name.to_string())
             .part(
                 "file",
@@ -459,11 +565,60 @@ pub struct Sender {
 /// app only; `union_id` the same person in every app of the same
 /// developer, which for an app made in a tenant (a custom app) is every
 /// custom app of the tenant.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SenderId {
     pub open_id: String,
     #[serde(default)]
     pub union_id: Option<String>,
+}
+
+/// `card.action.trigger` `event` body: a press on a card's button, or a
+/// form sent.
+#[derive(Debug, Deserialize)]
+pub struct CardAction {
+    pub operator: Operator,
+    pub action: Action,
+    #[serde(default)]
+    pub context: ActionContext,
+}
+
+/// Who pressed: the same ids as a sender's.
+#[derive(Debug, Deserialize)]
+pub struct Operator {
+    pub open_id: String,
+    #[serde(default)]
+    pub union_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Action {
+    /// The `value` of the button's callback.
+    #[serde(default)]
+    pub value: serde_json::Value,
+    /// A form's values, by each component's name.
+    #[serde(default)]
+    pub form_value: serde_json::Value,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ActionContext {
+    #[serde(default)]
+    pub open_message_id: String,
+    #[serde(default)]
+    pub open_chat_id: String,
+}
+
+/// `application.bot.menu_v6` `event` body: an item of the bot's menu,
+/// set up on the Developer Console, chosen.
+#[derive(Debug, Deserialize)]
+pub struct MenuEvent {
+    pub operator: MenuOperator,
+    pub event_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MenuOperator {
+    pub operator_id: SenderId,
 }
 
 #[derive(Debug, Deserialize)]

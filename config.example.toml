@@ -41,8 +41,5 @@ account_id = "acme-lark-bot"
 # signs webhook requests) with it. Recommended for a webhook.
 # encrypt_key = "the-encrypt-key-from-the-console"
 
-# Optional: voice-message transcription (OpenAI-compatible STT). Without a
-# key, inbound voice messages are dropped. Groq's free tier:
-# openai_api_key   = "gsk_..."
-# whisper_base_url = "https://api.groq.com/openai/v1"
-# whisper_model    = "whisper-large-v3-turbo"
+# Voice messages go to the gateway, which transcribes them when [transcription]
+# is set in its config.toml: nothing to set here.

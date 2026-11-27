@@ -10,7 +10,9 @@
 //!   from the daemon, `pong` from Lark, which may carry new settings), or a
 //!   data frame carrying an event's JSON, cut in parts when it is large;
 //! - each event is answered with its own frame, payload `{"code":200}`,
-//!   within 3 seconds, or Lark sends it again (which [`Incoming`] drops).
+//!   within 3 seconds, or Lark sends it again (which [`Incoming`] drops); a
+//!   press on a card (`card.action.trigger`) with what Lark is to do, the
+//!   JSON in the payload's `data`, base64, as Lark's SDKs send it.
 //!
 //! The connection is opened again, with a fresh URL, whenever it ends: the
 //! first time after a random wait of up to the settings' `ReconnectNonce`,
@@ -133,14 +135,17 @@ impl Frame {
     }
 
     /// The answer to this data frame: itself, with how long it took and
-    /// `code` in place of its payload.
-    fn answer(mut self, code: u16, took: Duration) -> Self {
+    /// `code` in place of its payload, and `data` when there is something
+    /// to say back.
+    fn answer(mut self, code: u16, data: Option<&serde_json::Value>, took: Duration) -> Self {
+        use base64::Engine as _;
         self.headers.push(Header {
             key: "biz_rt".into(),
             value: took.as_millis().to_string(),
         });
+        let data = data.map(|d| base64::engine::general_purpose::STANDARD.encode(d.to_string()));
         self.payload = Some(
-            json!({ "code": code, "headers": null, "data": null })
+            json!({ "code": code, "headers": null, "data": data })
                 .to_string()
                 .into_bytes(),
         );
@@ -457,24 +462,26 @@ fn handle(
             let Some(payload) = parts.whole(&frame) else {
                 return Handled::Nothing;
             };
-            let code = match frame.header("type") {
-                Some("event") => match serde_json::from_slice(&payload) {
+            // A card's press may come as a frame of its own kind.
+            let (code, data) = match frame.header("type") {
+                Some("event" | "card") => match serde_json::from_slice(&payload) {
                     Ok(event) => match incoming.take(event) {
-                        Taken::Done => 200,
-                        Taken::Refused => 403,
-                        Taken::Unreadable => 500,
+                        Taken::Done => (200, None),
+                        Taken::Answer(answer) => (200, Some(answer)),
+                        Taken::Refused => (403, None),
+                        Taken::Unreadable => (500, None),
                     },
                     Err(e) => {
                         warn!(error = %e, "lark long connection: an event is not JSON");
-                        500
+                        (500, None)
                     }
                 },
                 kind => {
                     debug!(kind, "lark long connection: not an event; answered");
-                    200
+                    (200, None)
                 }
             };
-            Handled::Answer(frame.answer(code, started.elapsed()))
+            Handled::Answer(frame.answer(code, data.as_ref(), started.elapsed()))
         }
         method => {
             debug!(method, "lark long connection: a frame of an unknown method");
@@ -606,14 +613,27 @@ mod tests {
 
     #[test]
     fn an_answer_is_the_frame_with_its_code() {
+        use base64::Engine as _;
         let frame = data(&[("type", "event"), ("message_id", "m1")], b"{}");
-        let answer = frame.answer(200, Duration::from_millis(12));
+        let answer = frame.clone().answer(200, None, Duration::from_millis(12));
         assert_eq!((answer.seq_id, answer.log_id, answer.service), (5, 9, 3));
         assert_eq!(answer.header("message_id"), Some("m1"));
         assert_eq!(answer.header("biz_rt"), Some("12"));
         let payload: serde_json::Value =
             serde_json::from_slice(answer.payload.as_deref().unwrap()).unwrap();
         assert_eq!(payload["code"], 200);
+        // What a press is answered with, as Lark's SDKs send it.
+        let said = json!({ "toast": { "type": "info", "content": "ok" } });
+        let answer = frame.answer(200, Some(&said), Duration::ZERO);
+        let payload: serde_json::Value =
+            serde_json::from_slice(answer.payload.as_deref().unwrap()).unwrap();
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(payload["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&data).unwrap(),
+            said
+        );
     }
 
     #[test]

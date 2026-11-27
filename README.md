@@ -34,12 +34,13 @@ The daemon waits for the gateway's first frame on each connection, which says wh
 ### 1. Lark Developer Console
 
 1. Create a **custom app**; note the **App ID** and **App Secret**.
-2. **Permissions**: grant `im:message`, `im:message:send_as_bot` (send messages), and `im:resource` (download voice/files). Add a bot to the app.
+2. **Permissions**: grant `im:message`, `im:message:send_as_bot` (send messages), `im:resource` (download and upload images and files) and `im:message.reactions:write_only` (the `Typing` reaction; `im:message` covers it too). Add a bot to the app.
 3. **Events & Callbacks**:
-   - Subscribe to **`im.message.receive_v1`**.
+   - Subscribe to the events **`im.message.receive_v1`** and **`application.bot.menu_v6`** (the bot's menu), and to the callback **`card.action.trigger`** (presses on the bot's cards), the same way as the events: by the long connection, or at the same Request URL.
    - **Long connection** (the default): choose **Receive events through persistent connection** (使用长连接接收事件). Lark checks that a client is connected when you save it, so start the daemon first (step 3).
    - **Webhook** (`events = "webhook"`): set **Request URL** to `https://<your-public-host>/webhook` (reverse-proxy it to this daemon's `webhook_listen`), and copy the **Verification Token** and (recommended) set and copy an **Encrypt Key**. The URL must be reachable from Lark's servers: put it behind your reverse proxy / TLS, the same way you front the havn gateway.
-4. Publish/enable the app for your tenant.
+4. **The bot's menu** (optional): under the bot's features, add menu items that send an event, each with a command's name as its event key (`new`, `stop`, `retry`, `model`, ...; the daemon's log lists the gateway's when it connects). Choosing one sends that command, as `/new` typed. Lark has no API for a bot's menu, so it is set up here.
+5. Publish/enable the app for your tenant.
 
 ### 2. havn side
 
@@ -101,18 +102,19 @@ PrivateTmp=true
 WantedBy=multi-user.target
 ```
 
-## Content support (v1)
+## What it does
 
-| | Inbound (user → agent) | Outbound (agent → user) |
-|---|---|---|
-| Text | ✅ native | ✅ native |
-| Voice | ✅ downloaded + transcribed (OpenAI-compatible STT, e.g. Groq) | flattened to text |
-| Location | ✅ native | flattened to text |
-| Image / File | text marker* | ✅ native (URL fetched, re-uploaded to Lark) |
+- **Private chats** (1:1, `p2p`) with the bot; group messages are dropped.
+- **Text and rich text** (`post`, flattened to its text), and **locations**, passed to the agent as such.
+- **Files both ways.** An image, a file, a voice message or a video someone sends is downloaded from Lark (at most 25 MB) and saved in the agent's inbox by the gateway, which also reads the text of a PDF, Word document or spreadsheet, and transcribes a voice message (`voice.ogg`) when `[transcription]` is set in its config.toml (see [Voice messages](https://github.com/amplimit/havn#voice-messages) in the Havn README); the agent gets the message with its file, a voice message with a line saying how long it is. A file that cannot be passed on is named in the message, with what went wrong, so the agent can say so. A sticker, which Lark lets no bot download, is a line saying so. A file the agent sends is fetched from the gateway and posted as an image when its bytes are one Lark shows (PNG, JPEG, GIF or WebP, at most 10 MB; one Lark refuses goes as a file), else as a file (Lark's `pdf`, `doc`, `xls`, `ppt`, `mp4` or `opus` by its extension, else `stream`; at most 30 MB); its caption follows it as a card. An image at an address of the agent's own goes as `[image: <url>]`: the daemon fetches only the gateway's files.
+- **Replies as cards.** The agent's Markdown is sent as a Lark card (JSON 2.0, `markdown`), which shows headings, bold, italic, strikethrough, links, inline code, code blocks with their language, lists, quotes and tables. Outside code, a `<` is written as `&#60;`, so tags such as `<at id=all>` show as written and mention no one, and an image becomes a link (a card shows only images uploaded to Lark). A long reply goes in several cards of at most 4000 characters, cut at paragraph, line or word breaks, a code block cut in two closed and opened again. A card Lark refuses goes as plain text, with a zero-width space after each `<`.
+- **Buttons.** Buttons the gateway puts under a message (such as **Approve** and **Deny** on a step waiting for approval, or the options of the agent's `ask_choice`) are buttons under its card, on the last of a long reply. A press goes to the gateway as if the person who pressed it had typed the button's command, with the same checks; it is answered at once, with the card shown again without its buttons, so it is pressed once. Only the person the card was sent to may press it: someone else, as in a forwarded copy, is told it is not theirs. A card sent before a restart keeps its buttons; a second press of one after it is told it was answered.
+- **Questions of several answers** (the agent's `ask_choice` with several to choose) are a card with the question, a menu that takes several (at most 50 options; more go as text) and a **Send** button: sent, the choice goes to the gateway as the person's answer, as a press does; sent with none chosen, the person is asked to choose one.
+- **The bot's menu.** An item of the menu set up on the Developer Console (see Setup) goes to the gateway as its command, typed by the person who chose it; the answer goes to them.
+- **A `Typing` reaction** on each message from when it arrives until its reply is sent (a part of a reply with more to come leaves it on), and on a card pressed until the answer to the press; with several messages waiting, each loses it as a reply comes, the oldest first, and one that gets no reply loses it after 5 minutes.
+- **Long connection or webhook**, each event taken once, replies resumed after a reconnect or restart: see "How it works".
 
-\* Inbound images/files are surfaced as a text marker rather than delivered: havn's content model is URL-based with no file host, and Lark resources require this adapter's token to fetch — so the agent can't retrieve them directly. Voice is the exception because it's transcribed to text here. Outbound image/file **is** native.
-
-v1 handles **1:1 (`p2p`) chats** only; group messages are dropped.
+`openai_api_key`, `whisper_base_url` and `whisper_model` are no longer used, as the gateway transcribes voice messages; a config that still has them loads, and the log says so.
 
 ## License
 
