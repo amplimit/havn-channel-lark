@@ -38,12 +38,20 @@ pub struct Config {
     #[serde(default = "default_lark_base_url")]
     pub lark_base_url: String,
 
-    /// How the app's events reach the daemon: `long_connection` (the
-    /// default), a WebSocket the daemon opens to Lark, or `webhook`, HTTP
-    /// requests to `webhook_listen`. It matches the subscription mode set
-    /// on the Developer Console.
-    #[serde(default)]
+    /// How the app's events reach the daemon: `long_connection`, a
+    /// WebSocket the daemon opens to Lark, or `webhook`, HTTP requests to
+    /// `webhook_listen`. It matches the subscription mode set on the
+    /// Developer Console. Left out, it is `webhook` for a config that sets
+    /// one up (`verification_token` or `webhook_listen`, as every config
+    /// did before the long connection), else `long_connection`.
+    #[serde(rename = "events", default)]
+    events_set: Option<Events>,
+
+    /// `events` as it was decided, and why.
+    #[serde(skip)]
     pub events: Events,
+    #[serde(skip)]
+    pub events_why: &'static str,
 
     /// havn gateway WebSocket URL. e.g. `ws://127.0.0.1:8100` or
     /// `wss://havn.example.com`. The daemon appends
@@ -69,7 +77,11 @@ pub struct Config {
     /// With `events = "webhook"`: the address the webhook HTTP server
     /// binds to. The operator points Lark's "Request URL" at
     /// `http(s)://<public-host>/webhook` and reverse-proxies it here.
-    #[serde(default = "default_webhook_listen")]
+    #[serde(rename = "webhook_listen", default)]
+    webhook_listen_set: Option<String>,
+
+    /// `webhook_listen`, or its default.
+    #[serde(skip)]
     pub webhook_listen: String,
 
     /// With `events = "webhook"`, required: Lark's event "Verification
@@ -126,17 +138,27 @@ fn default_channel_id() -> String {
     "lark".into()
 }
 
-fn default_webhook_listen() -> String {
-    "0.0.0.0:8090".into()
-}
+const DEFAULT_WEBHOOK_LISTEN: &str = "0.0.0.0:8090";
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let raw =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         // The parser's message only: its excerpt of the file may show a secret.
-        let cfg: Self = toml::from_str(&raw)
+        let mut cfg: Self = toml::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("parsing {} as TOML: {}", path.display(), e.message()))?;
+        (cfg.events, cfg.events_why) = match cfg.events_set {
+            Some(events) => (events, "as the config sets it"),
+            None if cfg.verification_token.is_some() || cfg.webhook_listen_set.is_some() => (
+                Events::Webhook,
+                "as the config sets up a webhook and does not set `events`",
+            ),
+            None => (Events::LongConnection, "the default"),
+        };
+        cfg.webhook_listen = cfg
+            .webhook_listen_set
+            .clone()
+            .unwrap_or_else(|| DEFAULT_WEBHOOK_LISTEN.into());
         cfg.validate()?;
         Ok(cfg)
     }
@@ -215,8 +237,38 @@ mod tests {
         assert_eq!(c.channel_id, "lark"); // default
         assert_eq!(c.lark_base_url, "https://open.larksuite.com"); // default
         assert_eq!(c.webhook_listen, "0.0.0.0:8090"); // default
-        assert_eq!(c.events, Events::LongConnection); // default
+        // A config of before the long connection: it stays on the webhook.
+        assert_eq!(c.events, Events::Webhook);
         assert!(c.encrypt_key.is_none());
+    }
+
+    #[test]
+    fn a_config_that_sets_up_a_webhook_stays_on_it_unless_it_says_otherwise() {
+        let base = r#"
+            app_id = "cli_abc"
+            app_secret = "sec"
+            havn_gateway = "ws://h"
+            adapter_token = "tok"
+            account_id = "bot"
+            "#;
+        let listen = format!("{base}webhook_listen = \"127.0.0.1:9000\"\n");
+        let c = Config::load(&write_temp(&listen)).unwrap_err();
+        assert!(format!("{c:#}").contains("verification_token"), "{c:#}");
+        let c = Config::load(&write_temp(&format!(
+            "{listen}verification_token = \"v\"\n"
+        )))
+        .unwrap();
+        assert_eq!(
+            (c.events, c.webhook_listen.as_str()),
+            (Events::Webhook, "127.0.0.1:9000")
+        );
+        assert!(c.events_why.contains("sets up a webhook"));
+        let c = Config::load(&write_temp(&format!(
+            "{base}verification_token = \"v\"\nevents = \"long_connection\"\n"
+        )))
+        .unwrap();
+        assert_eq!(c.events, Events::LongConnection);
+        assert_eq!(c.events_why, "as the config sets it");
     }
 
     #[test]
@@ -230,6 +282,7 @@ mod tests {
             "#;
         let c = Config::load(&write_temp(base)).unwrap();
         assert!(c.verification_token.is_none());
+        assert_eq!(c.events, Events::LongConnection);
         assert!(Config::load(&write_temp(&format!("{base}\nevents = \"webhook\"\n"))).is_err());
         let c = Config::load(&write_temp(&format!(
             "{base}\nevents = \"webhook\"\nverification_token = \"vtok\"\n"

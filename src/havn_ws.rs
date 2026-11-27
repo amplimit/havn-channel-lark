@@ -12,8 +12,9 @@
 //!   that came after it, before any new one
 //! - heartbeat via `ChannelFrame::Ping` / `Pong`
 //! - the gateway's first frame, `ChannelFrame::Commands`, says whether it
-//!   takes a sender's aliases (havn issue #262): until it does, an inbound
-//!   goes with the id an older gateway knows its sender by
+//!   takes a sender's aliases (havn issue #262): until one does, an inbound
+//!   goes with the id an older gateway knows its sender by; once one did,
+//!   kept in the state file, never again
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -82,6 +83,9 @@ pub struct Delivered {
     account_id: String,
     got: Mutex<Option<u64>>,
     marks: Mutex<Marks>,
+    /// A gateway took the senders' aliases (havn issue #262): from then on
+    /// senders go by their new ids, as their links moved to them.
+    aliases: std::sync::atomic::AtomicBool,
     /// A write that failed is said once.
     warned: std::sync::atomic::AtomicBool,
 }
@@ -106,11 +110,16 @@ const DONE_KEPT: usize = 1024;
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Kept {
     account_id: String,
-    seq: u64,
+    /// None before a reply was delivered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seq: Option<u64>,
     /// Replies past `seq` that were delivered. Absent from a file of an
     /// older daemon.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     done: Vec<u64>,
+    /// A gateway took the senders' aliases.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    aliases: bool,
 }
 
 impl Delivered {
@@ -123,18 +132,25 @@ impl Delivered {
             .and_then(|s| serde_json::from_str::<Kept>(&s).ok())
             .filter(|k| k.account_id == account_id);
         let marks = Marks {
-            upto: kept.as_ref().map(|k| k.seq),
+            upto: kept.as_ref().and_then(|k| k.seq),
             waiting: std::collections::BTreeSet::new(),
             done: kept
                 .as_ref()
-                .map(|k| k.done.iter().copied().filter(|s| *s > k.seq).collect())
+                .map(|k| {
+                    k.done
+                        .iter()
+                        .copied()
+                        .filter(|s| k.seq.is_none_or(|q| *s > q))
+                        .collect()
+                })
                 .unwrap_or_default(),
         };
         Self {
             path,
             account_id: account_id.to_string(),
-            got: Mutex::new(kept.map(|k| k.seq)),
+            got: Mutex::new(kept.as_ref().and_then(|k| k.seq)),
             marks: Mutex::new(marks),
+            aliases: std::sync::atomic::AtomicBool::new(kept.is_some_and(|k| k.aliases)),
             warned: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -208,8 +224,8 @@ impl Delivered {
     /// The reply numbered `seq` was delivered: kept, the file replaced
     /// whole so a crash leaves the old one or the new one.
     pub fn mark(&self, seq: u64) {
-        let kept = {
-            let mut marks = self.marks();
+        let mut marks = self.marks();
+        {
             marks.waiting.remove(&seq);
             marks.done.insert(seq);
             let last_done = marks.done.last().copied().unwrap_or(seq);
@@ -228,11 +244,35 @@ impl Delivered {
             while marks.done.len() > DONE_KEPT {
                 marks.done.pop_first();
             }
-            Kept {
-                account_id: self.account_id.clone(),
-                seq: upto,
-                done: marks.done.iter().copied().collect(),
-            }
+        }
+        self.keep(&marks);
+    }
+
+    /// Whether a gateway took the senders' aliases, now or before a restart.
+    pub fn takes_aliases(&self) -> bool {
+        self.aliases.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A gateway said it takes the senders' aliases: kept.
+    pub fn took_aliases(&self) {
+        if !self
+            .aliases
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            let marks = self.marks();
+            self.keep(&marks);
+        }
+    }
+
+    /// Replace the file whole with `marks` and the aliases flag, so a crash
+    /// leaves the old one or the new one; with the marks' lock held, so an
+    /// older write cannot come after a newer one.
+    fn keep(&self, marks: &Marks) {
+        let kept = Kept {
+            account_id: self.account_id.clone(),
+            seq: marks.upto,
+            done: marks.done.iter().copied().collect(),
+            aliases: self.takes_aliases(),
         };
         let Some(path) = &self.path else {
             return;
@@ -381,10 +421,9 @@ async fn run_session(
     let (mut sink, mut stream) = ws.split();
     // Nothing is sent before the gateway's first frame, which says whether
     // it takes a sender's aliases; one that sends none in time is older.
-    let mut aliases = false;
     match tokio::time::timeout(FIRST_FRAME_WAIT, stream.next()).await {
         Ok(Some(Ok(msg))) => match pass_on(msg, inbound_tx, delivered).await {
-            Passed::On(taken) => aliases = taken,
+            Passed::On => {}
             Passed::Closed => return SessionEnd::WsClosed,
             Passed::Gone => return SessionEnd::OutboundClosed,
         },
@@ -392,7 +431,7 @@ async fn run_session(
         Ok(None) => return SessionEnd::WsClosed,
         Err(_) => {}
     }
-    if !aliases {
+    if !delivered.takes_aliases() {
         info!("havn WS: the gateway does not take sender aliases; senders go by their open_id");
     }
     loop {
@@ -404,7 +443,7 @@ async fn run_session(
                     let _ = sink.send(Message::Close(None)).await;
                     return SessionEnd::OutboundClosed;
                 };
-                let s = match serde_json::to_string(&for_gateway(frame, aliases)) {
+                let s = match serde_json::to_string(&for_gateway(frame, delivered.takes_aliases())) {
                     Ok(s) => s,
                     Err(e) => {
                         warn!(error = %e, "havn WS: serialize ChannelFrame failed; skipping");
@@ -423,7 +462,7 @@ async fn run_session(
                     None => return SessionEnd::WsClosed,
                 };
                 match pass_on(msg, inbound_tx, delivered).await {
-                    Passed::On(_) => {}
+                    Passed::On => {}
                     Passed::Closed => return SessionEnd::WsClosed,
                     Passed::Gone => return SessionEnd::OutboundClosed,
                 }
@@ -434,9 +473,8 @@ async fn run_session(
 
 /// What became of a message from the gateway.
 enum Passed {
-    /// Passed on to the daemon, or skipped: whether it was the command menu
-    /// of a gateway that takes a sender's aliases.
-    On(bool),
+    /// Passed on to the daemon, or skipped.
+    On,
     /// The gateway closed the connection.
     Closed,
     /// The daemon's consumer is gone: shutdown is in progress.
@@ -454,24 +492,26 @@ async fn pass_on(
                 Ok(f) => f,
                 Err(e) => {
                     warn!(error = %e, "havn WS: malformed frame; skipping");
-                    return Passed::On(false);
+                    return Passed::On;
                 }
             };
             if let ChannelFrame::Outbound(o) = &parsed {
                 delivered.got(o.seq);
             }
-            let aliases = matches!(&parsed, ChannelFrame::Commands(c) if c.sender_aliases);
+            // Any menu of a gateway that takes them, the first or a later
+            // one; one that does not leaves it as it was.
+            if matches!(&parsed, ChannelFrame::Commands(c) if c.sender_aliases) {
+                delivered.took_aliases();
+            }
             if inbound_tx.send(parsed).await.is_err() {
                 return Passed::Gone;
             }
-            Passed::On(aliases)
+            Passed::On
         }
         Message::Close(_) => Passed::Closed,
         // Control frames — tungstenite auto-responds to protocol-level
         // Pings; we don't need to.
-        Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {
-            Passed::On(false)
-        }
+        Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => Passed::On,
     }
 }
 
@@ -538,6 +578,29 @@ mod tests {
             sender(&for_gateway(inbound("lark:ou_o", &[]), false)),
             ("lark:ou_o".into(), Vec::new())
         );
+    }
+
+    #[test]
+    fn a_gateway_that_took_aliases_is_remembered_across_a_restart() {
+        let d = dir("aliases");
+        let path = Delivered::file_in(&d, "bot");
+        let delivered = Delivered::load(Some(path.clone()), "bot");
+        assert!(!delivered.takes_aliases());
+        delivered.took_aliases();
+        assert!(delivered.takes_aliases());
+        let again = Delivered::load(Some(path.clone()), "bot");
+        assert!(again.takes_aliases(), "before any reply was delivered");
+        assert_eq!(again.since(), None);
+        again.got(7);
+        again.mark(7);
+        let again = Delivered::load(Some(path.clone()), "bot");
+        assert!(again.takes_aliases() && again.since() == Some(7));
+        // A file of before has neither.
+        std::fs::write(&path, r#"{"account_id":"bot","seq":3}"#).unwrap();
+        let old = Delivered::load(Some(path), "bot");
+        assert!(!old.takes_aliases());
+        assert_eq!(old.since(), Some(3));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

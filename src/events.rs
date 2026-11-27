@@ -7,16 +7,19 @@
 //! - drops one already taken, by `event_id` and by `message_id`, so Lark's
 //!   retries make no second turn,
 //! - translates each inbound message into a havn `ChannelInbound` and
-//!   forwards it over the gateway WS.
+//!   forwards it over the gateway WS, without the payload's Verification
+//!   Token and tenant key.
 //!
 //! The webhook also answers the one-time `url_verification` challenge and,
-//! with an Encrypt Key, refuses a request whose signature does not match.
+//! with an Encrypt Key, refuses a request whose signature does not match or
+//! is older than [`SIGNED_FOR`].
 //!
 //! Lark wants an answer within 3 seconds, so translation (which may do a
-//! resource download + STT) runs in a spawned task; the event is answered
+//! resource download + STT) runs in a worker of the message's chat, which
+//! takes the chat's messages in the order they came; the event is answered
 //! at once.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -48,6 +51,20 @@ pub const PREFIX: &str = "lark:";
 /// hours, far fewer than this many events.
 const SEEN_KEPT: usize = 4096;
 
+/// Messages of a chat waiting for its worker at most; past that, a new one
+/// is dropped.
+const CHAT_WAITING: usize = 64;
+/// A chat's worker with nothing to do for this long ends; the next message
+/// starts another.
+const CHAT_IDLE: std::time::Duration = std::time::Duration::from_secs(240);
+/// A signed webhook request older or newer than this is refused, so one
+/// seen on the way cannot be sent again later.
+pub const SIGNED_FOR: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The workers of the chats messages came in, by chat: each takes its
+/// chat's messages in order.
+pub type Chats = Arc<Mutex<HashMap<String, mpsc::Sender<(MessageReceiveEvent, Value)>>>>;
+
 /// What takes Lark's events, from either transport.
 #[derive(Clone)]
 pub struct Incoming {
@@ -59,6 +76,7 @@ pub struct Incoming {
     pub seen: Arc<Mutex<Seen>>,
     pub verification_token: Option<String>,
     pub encrypt_key: Option<String>,
+    pub chats: Chats,
 }
 
 /// What became of an event.
@@ -182,10 +200,73 @@ impl Incoming {
             return Taken::Done;
         }
         // Translate + forward off the answer's path (Lark wants it within
-        // 3s; STT/download can take longer).
-        tokio::spawn(translate_and_forward(self.clone(), ev, payload));
+        // 3s; STT/download can take longer), in the chat's order.
+        self.to_chat(ev, without_secrets(payload));
         Taken::Done
     }
+
+    /// Hand `ev` to the worker of its chat, started when it has none.
+    fn to_chat(&self, ev: MessageReceiveEvent, raw: Value) {
+        let chat = ev.message.chat_id.clone();
+        let mut chats = self
+            .chats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tx = chats.entry(chat.clone()).or_insert_with(|| {
+            let (tx, rx) = mpsc::channel(CHAT_WAITING);
+            tokio::spawn(chat_worker(self.clone(), chat.clone(), rx));
+            tx
+        });
+        if tx.try_send((ev, raw)).is_err() {
+            warn!(chat = %chat, "lark: a chat has as many messages waiting as it may; dropping one");
+        }
+    }
+}
+
+/// Translate and forward the messages of `chat` one at a time, in the order
+/// they came. It ends after [`CHAT_IDLE`] with nothing to do, under the lock
+/// [`Incoming::to_chat`] adds with, so no message is left behind.
+async fn chat_worker(
+    incoming: Incoming,
+    chat: String,
+    mut rx: mpsc::Receiver<(MessageReceiveEvent, Value)>,
+) {
+    loop {
+        let next = match tokio::time::timeout(CHAT_IDLE, rx.recv()).await {
+            Ok(Some(next)) => next,
+            Ok(None) => return,
+            Err(_) => {
+                let mut chats = incoming
+                    .chats
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Ok(next) = rx.try_recv() {
+                    next
+                } else {
+                    chats.remove(&chat);
+                    return;
+                }
+            }
+        };
+        let (ev, raw) = next;
+        translate_and_forward(incoming.clone(), ev, raw).await;
+    }
+}
+
+/// `payload` without what is not the agent's to see: the app's
+/// Verification Token and the tenant's key.
+fn without_secrets(mut payload: Value) -> Value {
+    if let Some(header) = payload.get_mut("header").and_then(Value::as_object_mut) {
+        header.remove("token");
+        header.remove("tenant_key");
+    }
+    if let Some(sender) = payload
+        .pointer_mut("/event/sender")
+        .and_then(Value::as_object_mut)
+    {
+        sender.remove("tenant_key");
+    }
+    payload
 }
 
 /// Build the webhook router. The operator points Lark's "Request URL" at
@@ -201,6 +282,20 @@ async fn handle(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
+    // A signed request is checked before anything else is read of it.
+    let signature = headers.contains_key("X-Lark-Signature");
+    if let Some(key) = incoming.encrypt_key.as_deref()
+        && signature
+    {
+        if !signed(&headers, key, &body) {
+            warn!("webhook: wrong signature; refusing the request");
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        if !recent(&headers, std::time::SystemTime::now()) {
+            warn!("webhook: a signed request too old or too new; refusing it");
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
     let raw: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -233,10 +328,8 @@ async fn handle(
     }
 
     // With an Encrypt Key, Lark signs every event it sends.
-    if let Some(key) = incoming.encrypt_key.as_deref()
-        && !signed(&headers, key, &body)
-    {
-        warn!("webhook: event signature missing or wrong; refusing it");
+    if incoming.encrypt_key.is_some() && !signature {
+        warn!("webhook: an event without a signature; refusing it");
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -264,6 +357,23 @@ fn signed(headers: &HeaderMap, encrypt_key: &str, body: &[u8]) -> bool {
         expected.as_bytes(),
         signature.to_ascii_lowercase().as_bytes(),
     )
+}
+
+/// Whether the request's timestamp (seconds) is within [`SIGNED_FOR`] of
+/// `now`.
+fn recent(headers: &HeaderMap, now: std::time::SystemTime) -> bool {
+    let Some(at) = headers
+        .get("X-Lark-Request-Timestamp")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    else {
+        return false;
+    };
+    let now = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    now.abs_diff(at) <= SIGNED_FOR.as_secs()
 }
 
 fn signature_of(timestamp: &str, nonce: &str, encrypt_key: &str, body: &[u8]) -> String {
@@ -591,6 +701,25 @@ mod tests {
     }
 
     #[test]
+    fn a_signed_request_is_taken_within_five_minutes_of_its_timestamp() {
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Lark-Request-Timestamp", "1700000000".parse().unwrap());
+        assert!(recent(&headers, at));
+        assert!(recent(&headers, at + SIGNED_FOR));
+        assert!(!recent(
+            &headers,
+            at + SIGNED_FOR + std::time::Duration::from_secs(1)
+        ));
+        assert!(!recent(
+            &headers,
+            at - SIGNED_FOR - std::time::Duration::from_secs(1)
+        ));
+        headers.insert("X-Lark-Request-Timestamp", "soon".parse().unwrap());
+        assert!(!recent(&headers, at));
+    }
+
+    #[test]
     fn seen_events_and_messages_are_taken_once_up_to_a_bound() {
         let mut seen = Seen::default();
         assert!(seen.first_event("e1"));
@@ -640,6 +769,7 @@ mod tests {
                 seen: Arc::new(Mutex::new(Seen::default())),
                 verification_token: token.map(String::from),
                 encrypt_key: key.map(String::from),
+                chats: Chats::default(),
             },
             rx,
         )
@@ -692,8 +822,42 @@ mod tests {
         assert_eq!(got[1].channel_message_id, "om_2");
         assert_eq!(got[0].sender_id, "lark:on_b");
         assert_eq!(got[0].sender_aliases, vec!["lark:ou_a".to_string()]);
+        // Without what is not the agent's to see.
+        let raw = got[0].raw.as_ref().unwrap();
+        assert!(raw["header"].get("token").is_none() && raw["header"].get("tenant_key").is_none());
+        assert_eq!(raw["header"]["event_id"], "e1");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err(), "no third inbound");
+    }
+
+    #[tokio::test]
+    async fn a_chat_s_messages_go_on_in_the_order_they_came() {
+        let (incoming, mut rx) = incoming(None, None);
+        for n in 0..40 {
+            let mut event = message_event(&format!("e{n}"), &format!("om_{n}"), "");
+            // Two chats, interleaved.
+            event["event"]["message"]["chat_id"] = json!(format!("oc_{}", n % 2));
+            assert_eq!(incoming.take(event), Taken::Done);
+        }
+        let mut seen: HashMap<String, Vec<u32>> = HashMap::new();
+        for _ in 0..40 {
+            let Some(ChannelFrame::Inbound(inb)) = rx.recv().await else {
+                panic!("expected an inbound");
+            };
+            let n: u32 = inb
+                .channel_message_id
+                .trim_start_matches("om_")
+                .parse()
+                .unwrap();
+            seen.entry(format!("oc_{}", n % 2)).or_default().push(n);
+        }
+        for (chat, got) in &seen {
+            let mut sorted = got.clone();
+            sorted.sort_unstable();
+            assert_eq!(got, &sorted, "{chat} in order");
+            assert_eq!(got.len(), 20);
+        }
+        assert_eq!(incoming.chats.lock().unwrap().len(), 2, "a worker per chat");
     }
 
     #[tokio::test]

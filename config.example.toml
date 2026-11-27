@@ -24,7 +24,9 @@ account_id = "acme-lark-bot"
 
 # How Lark sends the app's events, as set on the Developer Console (Events &
 # Callbacks): "long_connection" (the default), a WebSocket this daemon opens
-# to Lark, which needs no public address; or "webhook".
+# to Lark, which needs no public address; or "webhook". Left out, it is
+# "webhook" when verification_token or webhook_listen is set (as in a config
+# of before the long connection), else "long_connection".
 # events = "long_connection"
 
 # With events = "webhook": the address the webhook server binds to. Point

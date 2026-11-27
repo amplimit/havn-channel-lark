@@ -80,6 +80,7 @@ async fn main() -> Result<()> {
         channel = %cfg.channel_id,
         account = %cfg.account_id,
         events = ?cfg.events,
+        why = cfg.events_why,
         "havn-channel-lark starting"
     );
 
@@ -140,6 +141,7 @@ async fn main() -> Result<()> {
         account_id: cfg.account_id.clone(),
         seq: Arc::new(AtomicU64::new(1)),
         seen: Arc::default(),
+        chats: Arc::default(),
         verification_token: cfg.verification_token.clone(),
         encrypt_key: cfg.encrypt_key.clone(),
     };

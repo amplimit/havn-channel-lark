@@ -14,7 +14,9 @@
 //!
 //! The connection is opened again, with a fresh URL, whenever it ends: the
 //! first time after a random wait of up to the settings' `ReconnectNonce`,
-//! then every `ReconnectInterval`, without end.
+//! then every `ReconnectInterval`, without end. While Lark refuses the app
+//! (wrong id or secret, the long connection not chosen, too many
+//! connections), the wait doubles each time, up to [`REFUSED_WAIT_MAX`].
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -48,6 +50,32 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const PARTS_WAIT: Duration = Duration::from_secs(5);
 /// Events waiting for their parts at most; past that, the oldest go.
 const PARTS_KEPT: usize = 64;
+/// The parts an event may be cut in, and the bytes it may have put
+/// together, at most: past them it is dropped.
+const PARTS_MAX: usize = 64;
+const EVENT_BYTES_MAX: usize = 4 * 1024 * 1024;
+/// The longest wait between connections while Lark refuses the app.
+const REFUSED_WAIT_MAX: Duration = Duration::from_mins(30);
+/// Lark's codes for a refusal to retry as any failure: busy, or its own
+/// error (`ws/const.go` of its Go SDK).
+const SYSTEM_BUSY: i64 = 1;
+const INTERNAL_ERROR: i64 = 1_000_040_343;
+/// The handshake statuses that refuse the app: forbidden, or the app's
+/// credentials or connections refused.
+const FORBIDDEN: &str = "403";
+const AUTH_FAILED: &str = "514";
+
+/// Lark refused the app itself, not the moment: waiting longer helps.
+#[derive(Debug)]
+struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
 
 /// One message of the long connection (Lark's `pbbp2.Frame`).
 #[derive(Clone, PartialEq, prost::Message)]
@@ -193,23 +221,43 @@ pub async fn run(cfg: LongConnConfig, incoming: Incoming) {
     };
     let mut settings = Settings::default();
     let mut failed = 0u32;
+    let mut refused = 0u32;
     loop {
         match connect(&http, &cfg, &mut settings).await {
             Ok((ws, service)) => {
                 info!(lark = %cfg.base_url, "lark long connection open");
                 failed = 0;
+                refused = 0;
                 let ended = session(ws, service, &mut settings, &incoming).await;
                 warn!(error = %ended, "lark long connection ended; opening it again");
             }
-            Err(e) => warn!(error = %format!("{e:#}"), "lark long connection could not open"),
+            Err(e) => {
+                if e.downcast_ref::<Refused>().is_some() {
+                    refused = refused.saturating_add(1);
+                }
+                warn!(error = %format!("{e:#}"), "lark long connection could not open");
+            }
         }
-        let wait = if failed == 0 {
-            random_up_to(settings.nonce)
-        } else {
-            settings.reconnect
-        };
+        let wait = next_wait(&settings, failed, refused);
         failed = failed.saturating_add(1);
         tokio::time::sleep(wait).await;
+    }
+}
+
+/// How long to wait before connecting again, after `failed` failures in a
+/// row, `refused` of them Lark's refusals of the app.
+fn next_wait(settings: &Settings, failed: u32, refused: u32) -> Duration {
+    if refused > 0 {
+        let times = 1u32 << (refused - 1).min(16);
+        return settings
+            .reconnect
+            .saturating_mul(times)
+            .min(REFUSED_WAIT_MAX);
+    }
+    if failed == 0 {
+        random_up_to(settings.nonce)
+    } else {
+        settings.reconnect
     }
 }
 
@@ -253,13 +301,16 @@ async fn connect(
         .json()
         .await
         .with_context(|| format!("Lark's answer for the long connection (HTTP {status})"))?;
+    if matches!(body.code, SYSTEM_BUSY | INTERNAL_ERROR) {
+        bail!("Lark is busy: code={} msg={}", body.code, body.msg);
+    }
     if body.code != 0 {
-        bail!(
+        return Err(Refused(format!(
             "Lark refused the long connection: code={} msg={} (check the app id and secret, and \
              that the app receives events through the long connection on the Developer Console)",
-            body.code,
-            body.msg
-        );
+            body.code, body.msg
+        ))
+        .into());
     }
     let endpoint = body
         .data
@@ -286,13 +337,20 @@ async fn connect(
                     .unwrap_or_default()
                     .to_string()
             };
-            bail!(
-                "{host} refused the long connection: HTTP {}, status {} {} (auth code {})",
+            let status = header("Handshake-Status");
+            let said = format!(
+                "{host} refused the long connection: HTTP {}, status {status} {} (auth code {})",
                 resp.status(),
-                header("Handshake-Status"),
                 header("Handshake-Msg"),
                 header("Handshake-Autherrcode"),
-            )
+            );
+            if status == FORBIDDEN
+                || status == AUTH_FAILED
+                || resp.status() == reqwest::StatusCode::FORBIDDEN.as_u16()
+            {
+                return Err(Refused(said).into());
+            }
+            bail!(said)
         }
         Err(e) => Err(e).with_context(|| format!("connecting to {host}")),
     }
@@ -442,6 +500,13 @@ impl Parts {
         if sum <= 1 {
             return Some(payload);
         }
+        if sum > PARTS_MAX {
+            warn!(
+                sum,
+                "lark long connection: an event in too many parts; dropping it"
+            );
+            return None;
+        }
         let seq = frame.number("seq");
         if seq >= sum {
             warn!(
@@ -470,6 +535,15 @@ impl Parts {
             entry.1 = vec![None; sum];
         }
         entry.1[seq] = Some(payload);
+        let bytes: usize = entry.1.iter().flatten().map(Vec::len).sum();
+        if bytes > EVENT_BYTES_MAX {
+            warn!(
+                bytes,
+                "lark long connection: an event too large; dropping it"
+            );
+            self.waiting.remove(&id);
+            return None;
+        }
         if entry.1.iter().any(Option::is_none) {
             return None;
         }
@@ -567,6 +641,35 @@ mod tests {
         );
         // A part past the last is dropped.
         assert_eq!(parts.whole(&part("3", b"d")), None);
+    }
+
+    #[test]
+    fn an_event_in_too_many_parts_or_too_large_is_dropped() {
+        let mut parts = Parts::default();
+        let many = data(&[("message_id", "m"), ("sum", "65"), ("seq", "0")], b"a");
+        assert_eq!(parts.whole(&many), None);
+        assert!(parts.waiting.is_empty(), "nothing kept of it");
+        let big = vec![b'x'; EVENT_BYTES_MAX / 2 + 1];
+        let part = |seq: &str| data(&[("message_id", "m"), ("sum", "3"), ("seq", seq)], &big);
+        assert_eq!(parts.whole(&part("0")), None);
+        assert_eq!(parts.whole(&part("1")), None);
+        assert!(parts.waiting.is_empty(), "dropped once past the bound");
+        assert_eq!(parts.whole(&part("2")), None);
+    }
+
+    #[test]
+    fn the_wait_doubles_while_lark_refuses_the_app() {
+        let settings = Settings {
+            ping: PING_EVERY,
+            reconnect: Duration::from_secs(10),
+            nonce: Duration::from_secs(2),
+        };
+        assert!(next_wait(&settings, 0, 0) <= Duration::from_secs(2));
+        assert_eq!(next_wait(&settings, 3, 0), Duration::from_secs(10));
+        assert_eq!(next_wait(&settings, 1, 1), Duration::from_secs(10));
+        assert_eq!(next_wait(&settings, 2, 2), Duration::from_secs(20));
+        assert_eq!(next_wait(&settings, 4, 4), Duration::from_secs(80));
+        assert_eq!(next_wait(&settings, 99, 99), REFUSED_WAIT_MAX);
     }
 
     #[test]
