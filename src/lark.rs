@@ -21,9 +21,22 @@ use tracing::{debug, info, warn};
 
 /// Refresh the token this long before its stated expiry (default 7200s),
 /// leaving a safety margin so an in-flight request never races expiry.
-const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(30 * 60);
+const TOKEN_REFRESH_MARGIN: Duration = Duration::from_mins(30);
 /// On a refresh failure, retry this soon rather than waiting a full cycle.
 const TOKEN_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Lark's answer to a call past its frequency limit, with HTTP 429 (or 400
+/// from some older APIs), and `x-ogw-ratelimit-reset`, the seconds to wait
+/// (Open Platform, api-call-guide/frequency-control).
+const FREQUENCY_LIMIT: i64 = 99_991_400;
+/// The send and reply APIs' own: "This operation triggers the frequency
+/// limit" (5 messages a second to one user or group; im-v1/message/create).
+const MESSAGE_FREQUENCY_LIMIT: i64 = 230_020;
+/// Times a message is sent again when Lark says to slow down.
+const SLOW_DOWN_TRIES: u32 = 4;
+/// The longest wait for one try, whatever Lark asks: the chat waits, and
+/// no other.
+const SLOW_DOWN_FOR: Duration = Duration::from_secs(30);
 
 pub struct LarkClient {
     http: reqwest::Client,
@@ -44,23 +57,32 @@ impl LarkClient {
         app_id: String,
         app_secret: String,
     ) -> Result<(Arc<Self>, u64)> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .context("building Lark HTTP client")?;
-        let client = Arc::new(Self {
-            http,
-            base_url: base_url.trim_end_matches('/').to_string(),
-            app_id,
-            app_secret,
-            token: RwLock::new(String::new()),
-        });
+        let client = Self::unauthenticated(base_url, app_id, app_secret)?;
         let expire = client
             .refresh_token()
             .await
             .context("initial tenant_access_token")?;
         info!(expire_s = expire, "Lark tenant_access_token acquired");
         Ok((client, expire))
+    }
+
+    /// The client before it has a token.
+    pub fn unauthenticated(
+        base_url: String,
+        app_id: String,
+        app_secret: String,
+    ) -> Result<Arc<Self>> {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .context("building Lark HTTP client")?;
+        Ok(Arc::new(Self {
+            http,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            app_id,
+            app_secret,
+            token: RwLock::new(String::new()),
+        }))
     }
 
     /// Download arbitrary bytes from a URL (no Lark auth) — used to fetch an
@@ -157,11 +179,14 @@ impl LarkClient {
         self.send_message_req(req).await
     }
 
-    /// Execute a send/reply request, refreshing the token once on a 401.
+    /// Execute a send/reply request: the token refreshed once when Lark
+    /// says it expired, and sent again after the wait Lark asks for when it
+    /// says to slow down ([`slowed_down`]), up to [`SLOW_DOWN_TRIES`] times.
     async fn send_message_req(&self, req: reqwest::RequestBuilder) -> Result<String> {
         #[derive(Deserialize)]
         struct SendResp {
             code: i64,
+            #[serde(default)]
             msg: String,
             #[serde(default)]
             data: Option<SendData>,
@@ -170,53 +195,65 @@ impl LarkClient {
         struct SendData {
             message_id: String,
         }
-        // reqwest RequestBuilder isn't Clone once a body is set in all
-        // versions; rebuild via try_clone for the retry path.
-        let attempt = req.try_clone();
-        let resp = req
-            .header("Authorization", self.bearer().await)
-            .send()
-            .await
-            .context("POST im/v1 message")?;
-        let status = resp.status();
-        let parsed: SendResp = resp.json().await.context("decode send response")?;
-        // Lark usually returns HTTP 200 with code 99991663 (token expired) /
-        // 99991664 (token invalid) rather than a real 401.
-        if status == reqwest::StatusCode::UNAUTHORIZED
-            || matches!(parsed.code, 99_991_663 | 99_991_664)
-        {
-            // Token expired/invalid — refresh and retry once if we can.
-            warn!("Lark send got auth failure; refreshing token and retrying");
-            self.refresh_token().await.context("token refresh on 401")?;
-            if let Some(retry) = attempt {
-                let resp2: SendResp = retry
-                    .header("Authorization", self.bearer().await)
-                    .send()
-                    .await
-                    .context("retry POST im/v1 message")?
-                    .json()
-                    .await
-                    .context("decode retry send response")?;
-                if resp2.code != 0 {
-                    bail!(
-                        "Lark send failed after retry: code={} msg={}",
-                        resp2.code,
-                        resp2.msg
-                    );
+        let mut refreshed = false;
+        let mut slowed = 0u32;
+        loop {
+            let attempt = req
+                .try_clone()
+                .context("a send request that cannot be sent again")?;
+            let resp = attempt
+                .header("Authorization", self.bearer().await)
+                .send()
+                .await
+                .context("POST im/v1 message")?;
+            let status = resp.status();
+            let reset = resp
+                .headers()
+                .get("x-ogw-ratelimit-reset")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            let body = resp.text().await.context("read send response")?;
+            let parsed: SendResp = match serde_json::from_str(&body) {
+                Ok(p) => p,
+                // A 429 may come without Lark's body.
+                Err(_) if status == reqwest::StatusCode::TOO_MANY_REQUESTS => SendResp {
+                    code: FREQUENCY_LIMIT,
+                    msg: String::new(),
+                    data: None,
+                },
+                Err(e) => {
+                    return Err(e).with_context(|| format!("decode send response (HTTP {status})"));
                 }
-                return resp2
-                    .data
-                    .map(|d| d.message_id)
-                    .context("send response missing message_id");
+            };
+            // Lark usually returns HTTP 200 with code 99991663 (token
+            // expired) / 99991664 (token invalid) rather than a real 401.
+            if !refreshed
+                && (status == reqwest::StatusCode::UNAUTHORIZED
+                    || matches!(parsed.code, 99_991_663 | 99_991_664))
+            {
+                warn!("Lark send got auth failure; refreshing token and retrying");
+                self.refresh_token().await.context("token refresh on 401")?;
+                refreshed = true;
+                continue;
             }
+            if let Some(wait) = slowed_down(status, parsed.code, reset, slowed) {
+                warn!(
+                    code = parsed.code,
+                    wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+                    "Lark asks to slow down; sending again after the wait"
+                );
+                tokio::time::sleep(wait).await;
+                slowed += 1;
+                continue;
+            }
+            if parsed.code != 0 {
+                bail!("Lark send failed: code={} msg={}", parsed.code, parsed.msg);
+            }
+            return parsed
+                .data
+                .map(|d| d.message_id)
+                .context("send response missing message_id");
         }
-        if parsed.code != 0 {
-            bail!("Lark send failed: code={} msg={}", parsed.code, parsed.msg);
-        }
-        parsed
-            .data
-            .map(|d| d.message_id)
-            .context("send response missing message_id")
     }
 
     /// Download a message resource (`file_key`) — used for voice STT and
@@ -354,6 +391,28 @@ pub fn spawn_token_refresher(client: Arc<LarkClient>, initial_expire_s: u64) {
     });
 }
 
+/// How long to wait before sending again, when Lark said to slow down
+/// (HTTP 429, or one of its frequency-limit codes) and the message was sent
+/// again `tries` times so far: the seconds Lark asks for, else 1, 2, 4, ...;
+/// `None` when it did not say so, or after [`SLOW_DOWN_TRIES`].
+fn slowed_down(
+    status: reqwest::StatusCode,
+    code: i64,
+    reset_s: Option<u64>,
+    tries: u32,
+) -> Option<Duration> {
+    let limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || matches!(code, FREQUENCY_LIMIT | MESSAGE_FREQUENCY_LIMIT);
+    if !limited || tries >= SLOW_DOWN_TRIES {
+        return None;
+    }
+    let wait = reset_s.map_or_else(
+        || Duration::from_secs(1u64 << tries.min(5)),
+        |s| Duration::from_secs(s.max(1)),
+    );
+    Some(wait.min(SLOW_DOWN_FOR))
+}
+
 fn sleep_for(expire_s: u64) -> Duration {
     Duration::from_secs(expire_s)
         .checked_sub(TOKEN_REFRESH_MARGIN)
@@ -375,7 +434,12 @@ pub struct EventEnvelope {
 
 #[derive(Debug, Deserialize)]
 pub struct EventHeader {
+    /// The same for each time Lark sends the event again.
+    #[serde(default)]
+    pub event_id: String,
     pub event_type: String,
+    /// The app's Verification Token.
+    #[serde(default)]
     pub token: String,
 }
 
@@ -391,9 +455,15 @@ pub struct Sender {
     pub sender_id: SenderId,
 }
 
+/// The sender's ids (havn issue #262): `open_id` is the person in this
+/// app only; `union_id` the same person in every app of the same
+/// developer, which for an app made in a tenant (a custom app) is every
+/// custom app of the tenant.
 #[derive(Debug, Deserialize)]
 pub struct SenderId {
     pub open_id: String,
+    #[serde(default)]
+    pub union_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -406,4 +476,45 @@ pub struct LarkMessage {
     pub content: String,
     #[serde(default)]
     pub create_time: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_message_lark_asks_to_slow_down_for_is_sent_again_after_the_wait() {
+        let ok = reqwest::StatusCode::OK;
+        let many = reqwest::StatusCode::TOO_MANY_REQUESTS;
+        let bad = reqwest::StatusCode::BAD_REQUEST;
+        // The seconds Lark asks for, at most SLOW_DOWN_FOR.
+        assert_eq!(
+            slowed_down(many, FREQUENCY_LIMIT, Some(3), 0),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            slowed_down(many, FREQUENCY_LIMIT, Some(500), 0),
+            Some(SLOW_DOWN_FOR)
+        );
+        assert_eq!(
+            slowed_down(many, 0, Some(0), 0),
+            Some(Duration::from_secs(1))
+        );
+        // The codes alone, as with an older API's HTTP 400; else 1, 2, 4 s.
+        assert_eq!(
+            slowed_down(bad, MESSAGE_FREQUENCY_LIMIT, None, 0),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            slowed_down(bad, FREQUENCY_LIMIT, None, 2),
+            Some(Duration::from_secs(4))
+        );
+        // Not a limit, or tried enough.
+        assert_eq!(slowed_down(ok, 0, None, 0), None);
+        assert_eq!(slowed_down(bad, 230_013, Some(1), 0), None);
+        assert_eq!(
+            slowed_down(many, FREQUENCY_LIMIT, Some(1), SLOW_DOWN_TRIES),
+            None
+        );
+    }
 }

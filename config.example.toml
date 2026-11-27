@@ -22,17 +22,24 @@ adapter_token = "a-long-random-string"
 channel_id = "lark"
 account_id = "acme-lark-bot"
 
-# Webhook server bind address. Point Lark's "Request URL" at
-#   http(s)://<your-public-host>/webhook
-# and reverse-proxy it to this address (Lark International has no WebSocket
-# long-connection, so webhook is the only inbound path).
-webhook_listen = "0.0.0.0:8090"
+# How Lark sends the app's events, as set on the Developer Console (Events &
+# Callbacks): "long_connection" (the default), a WebSocket this daemon opens
+# to Lark, which needs no public address; or "webhook". Left out, it is
+# "webhook" when verification_token or webhook_listen is set (as in a config
+# of before the long connection), else "long_connection".
+# events = "long_connection"
 
-# Lark "Event Subscription" security (Developer Console → Events & Callbacks).
-verification_token = "the-verification-token-from-the-console"
-# Set this to the console's Encrypt Key. Strongly recommended; if you leave
-# encryption off on the console, omit this.
-encrypt_key = "the-encrypt-key-from-the-console"
+# With events = "webhook": the address the webhook server binds to. Point
+# Lark's "Request URL" at http(s)://<your-public-host>/webhook and
+# reverse-proxy it here.
+# webhook_listen = "0.0.0.0:8090"
+
+# With events = "webhook", required: the Verification Token from the console.
+# verification_token = "the-verification-token-from-the-console"
+
+# The console's Encrypt Key, if one is set: Lark then encrypts events (and
+# signs webhook requests) with it. Recommended for a webhook.
+# encrypt_key = "the-encrypt-key-from-the-console"
 
 # Optional: voice-message transcription (OpenAI-compatible STT). Without a
 # key, inbound voice messages are dropped. Groq's free tier:
