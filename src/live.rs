@@ -585,7 +585,7 @@ impl Replies {
         self.live.insert(
             w.reply.clone(),
             Live {
-                written: Written::new(&w.reply, &w.to, (kind, id.to_string()), answers),
+                written: Written::new(&w.reply, &w.to, (kind, id), answers),
                 latest: Some((w.text, w.buttons)),
                 next: now,
                 part: false,

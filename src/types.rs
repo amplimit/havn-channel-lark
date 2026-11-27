@@ -94,6 +94,58 @@ pub struct ChannelInbound {
     /// `POST /api/v1/channel/files` (havn issue #106).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
+    /// The group the message was sent in (havn issue #263); none in a
+    /// private chat. Replies go to the group, or to its thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<ChannelGroup>,
+}
+
+/// The group a message was sent in (havn issue #263).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelGroup {
+    /// `lark:` and the chat's id (`oc_`): what replies are sent to.
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_name: Option<String>,
+    /// The message is to the bot: it mentions it, replies to one of its
+    /// messages, or is a command. Others are kept for context.
+    #[serde(default)]
+    pub addressed: bool,
+    /// Whether the bot sees every message in the group; `None` when not
+    /// known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sees_all: Option<bool>,
+    /// What of the messages to it reaches the bot there, where known: a
+    /// mention of it, a reply to one of its messages, a command. Lark gives
+    /// a bot without the permission to read every message only mentions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reaches: Option<Vec<Reach>>,
+    /// The larger group this one is part of: none on Lark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<ChannelPlace>,
+    /// The thread (Lark's topic, `omt_`) the message was sent in (havn
+    /// issue #285): a conversation of its own, and replies go to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<ChannelPlace>,
+}
+
+/// A kind of message to the bot in a group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reach {
+    Mention,
+    Reply,
+    Command,
+}
+
+/// A space or a thread of a [`ChannelGroup`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelPlace {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// A file saved in the agent's inbox, as the gateway answered its upload.

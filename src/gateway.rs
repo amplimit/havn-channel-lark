@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail};
 use reqwest::header::CONTENT_TYPE;
 
-use crate::types::Attachment;
+use crate::types::{Attachment, ChannelGroup};
 
 /// The largest file passed either way: the gateway's limit.
 pub const MAX_FILE_BYTES: usize = 25 * 1024 * 1024;
@@ -68,11 +68,14 @@ impl Gateway {
 
     /// Give the gateway file `name` that `sender` sent, with the ids the
     /// sender went by before (havn issue #262), which its message names
-    /// too; the attachment their message then names.
+    /// too; the attachment their message then names. One sent in a group is
+    /// given for the group and its thread (havn issues #263, #288), which the
+    /// gateway lets in instead of the sender.
     pub async fn upload(
         &self,
         sender: &str,
         aliases: &[String],
+        group: Option<&ChannelGroup>,
         name: &str,
         media_type: &str,
         bytes: Vec<u8>,
@@ -81,6 +84,12 @@ impl Gateway {
         url.query_pairs_mut()
             .append_pair("sender", sender)
             .append_pair("name", name);
+        if let Some(g) = group {
+            url.query_pairs_mut().append_pair("group", &g.id);
+            if let Some(thread) = &g.thread {
+                url.query_pairs_mut().append_pair("thread", &thread.id);
+            }
+        }
         // The file may come before the gateway noted them; an older gateway
         // leaves them.
         if !aliases.is_empty() {

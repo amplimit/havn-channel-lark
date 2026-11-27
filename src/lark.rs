@@ -8,8 +8,11 @@
 //!   and put a reaction on a message and take it off.
 //! - Download message resources (`file_key`) a sender sent.
 //! - Upload images/files for native outbound delivery.
+//! - Read who the bot is, a group's name and its members' names, who sent a
+//!   message, and the permissions the tenant granted the app.
 //!
-//! Also defines the inbound event structs (`im.message.receive_v1`).
+//! Also defines the inbound event structs (`im.message.receive_v1`, and the
+//! bot added to or removed from a group).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -178,32 +181,13 @@ impl LarkClient {
         format!("Bearer {}", self.token.read().await)
     }
 
-    /// Send a message to a recipient. `receive_id_type` is e.g. `open_id`
-    /// or `chat_id`; `content` is the already-serialized JSON string Lark
-    /// expects (e.g. `{"text":"hi"}`).
-    pub async fn send_message(
-        &self,
-        receive_id_type: &str,
-        receive_id: &str,
-        msg_type: &str,
-        content: &str,
-    ) -> Result<Sent> {
-        let body = json!({
-            "receive_id": receive_id,
-            "msg_type": msg_type,
-            "content": content,
-        });
-        let req = self
-            .http
-            .post(self.url("/open-apis/im/v1/messages"))
-            .query(&[("receive_id_type", receive_id_type)])
-            .json(&body);
-        self.send_message_req(req, true).await
-    }
-
-    /// [`Self::send_message`] or, with `reply_to`, [`Self::reply_message`];
-    /// when Lark says to slow down, waiting only when `patient`, else
-    /// failing with [`SlowDown`].
+    /// Send a message to a recipient (`to`, Lark's `receive_id_type` and
+    /// id) or, with `reply_to`, reply to that message; `content` is the
+    /// serialized JSON Lark expects. When Lark says to slow down, it waits
+    /// only when `patient`, else fails with [`SlowDown`].
+    ///
+    /// A thread (`to` of kind [`THREAD`]) takes no message sent to it: the
+    /// message replies to the one `to` names, in the thread.
     pub async fn post_message(
         &self,
         reply_to: Option<&str>,
@@ -212,11 +196,16 @@ impl LarkClient {
         content: &str,
         patient: bool,
     ) -> Result<Sent> {
+        let reply_to = reply_to.or_else(|| (to.0 == THREAD).then_some(to.1));
         let req = match reply_to {
             Some(message_id) => self
                 .http
                 .post(self.url_of(&["open-apis", "im", "v1", "messages", message_id, "reply"]))
-                .json(&json!({ "msg_type": msg_type, "content": content })),
+                .json(&json!({
+                    "msg_type": msg_type,
+                    "content": content,
+                    "reply_in_thread": to.0 == THREAD,
+                })),
             None => self
                 .http
                 .post(self.url("/open-apis/im/v1/messages"))
@@ -246,21 +235,6 @@ impl LarkClient {
         self.call(req, true).await.map(|_| ())
     }
 
-    /// Reply to an existing message (threads under it).
-    pub async fn reply_message(
-        &self,
-        message_id: &str,
-        msg_type: &str,
-        content: &str,
-    ) -> Result<Sent> {
-        let body = json!({ "msg_type": msg_type, "content": content });
-        let req = self
-            .http
-            .post(self.url_of(&["open-apis", "im", "v1", "messages", message_id, "reply"]))
-            .json(&body);
-        self.send_message_req(req, true).await
-    }
-
     /// A send or reply request, as [`Self::call`]: the message sent.
     async fn send_message_req(&self, req: reqwest::RequestBuilder, patient: bool) -> Result<Sent> {
         #[derive(Deserialize)]
@@ -272,6 +246,7 @@ impl LarkClient {
         let data = self.call(req, patient).await?;
         let sent: SendData =
             serde_json::from_value(data).context("send response missing message_id")?;
+        crate::group::note_ours(&sent.message_id);
         Ok(Sent {
             message_id: sent.message_id,
             chat_id: sent.chat_id,
@@ -355,6 +330,136 @@ impl LarkClient {
             }
             return Ok(parsed.data.unwrap_or(serde_json::Value::Null));
         }
+    }
+
+    /// The bot's `open_id` (`/bot/v3/info`, which needs no permission): how
+    /// a mention of it names it.
+    pub async fn bot_open_id(&self) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Info {
+            code: i64,
+            #[serde(default)]
+            msg: String,
+            #[serde(default)]
+            bot: Option<Bot>,
+        }
+        #[derive(Deserialize)]
+        struct Bot {
+            #[serde(default)]
+            open_id: String,
+        }
+        let info: Info = self
+            .http
+            .get(self.url("/open-apis/bot/v3/info"))
+            .header("Authorization", self.bearer().await)
+            .send()
+            .await
+            .context("asking Lark who the bot is")?
+            .json()
+            .await
+            .context("Lark's answer of who the bot is")?;
+        match info.bot.map(|b| b.open_id).filter(|id| !id.is_empty()) {
+            Some(open_id) if info.code == 0 => Ok(open_id),
+            _ => bail!(
+                "Lark did not say who the bot is: code={} msg={}",
+                info.code,
+                info.msg
+            ),
+        }
+    }
+
+    /// The name of group `chat_id` (`im:chat:readonly`), when it has one.
+    pub async fn chat_name(&self, chat_id: &str) -> Result<Option<String>> {
+        let req = self
+            .http
+            .get(self.url_of(&["open-apis", "im", "v1", "chats", chat_id]));
+        let data = self.call(req, true).await?;
+        Ok(data
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|n| !n.is_empty())
+            .map(String::from))
+    }
+
+    /// The people in group `chat_id` (`im:chat:readonly`), by `open_id`, with
+    /// their names: at most `pages` pages of 100.
+    pub async fn chat_members(&self, chat_id: &str, pages: usize) -> Result<Vec<(String, String)>> {
+        let mut members = Vec::new();
+        let mut token: Option<String> = None;
+        for _ in 0..pages {
+            let mut query = vec![("member_id_type", "open_id"), ("page_size", "100")];
+            if let Some(t) = &token {
+                query.push(("page_token", t));
+            }
+            let req = self
+                .http
+                .get(self.url_of(&["open-apis", "im", "v1", "chats", chat_id, "members"]))
+                .query(&query);
+            let data = self.call(req, true).await?;
+            for item in data
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let id = item.get("member_id").and_then(serde_json::Value::as_str);
+                let name = item.get("name").and_then(serde_json::Value::as_str);
+                if let (Some(id), Some(name)) = (id, name) {
+                    members.push((id.to_string(), name.to_string()));
+                }
+            }
+            let more = data
+                .get("has_more")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            token = data
+                .get("page_token")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from);
+            if !more || token.is_none() {
+                break;
+            }
+        }
+        Ok(members)
+    }
+
+    /// Whether message `message_id` is one the bot sent: Lark names the app
+    /// as its sender.
+    pub async fn sent_by_bot(&self, message_id: &str) -> Result<bool> {
+        let req = self
+            .http
+            .get(self.url_of(&["open-apis", "im", "v1", "messages", message_id]));
+        let data = self.call(req, true).await?;
+        let sender = data
+            .get("items")
+            .and_then(|i| i.get(0))
+            .and_then(|m| m.get("sender"))
+            .cloned()
+            .unwrap_or_default();
+        let field = |name: &str| {
+            sender
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        Ok(field("sender_type") == "app" && field("id") == self.app_id)
+    }
+
+    /// The permissions the tenant granted the app (`/application/v6/scopes`,
+    /// which needs none).
+    pub async fn granted_scopes(&self) -> Result<Vec<String>> {
+        let req = self.http.get(self.url("/open-apis/application/v6/scopes"));
+        let data = self.call(req, true).await?;
+        Ok(data
+            .get("scopes")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|s| s.get("grant_status").and_then(serde_json::Value::as_i64) == Some(1))
+            .filter_map(|s| s.get("scope_name").and_then(serde_json::Value::as_str))
+            .map(String::from)
+            .collect())
     }
 
     /// Put the reaction `emoji_type` (as `Typing`) on message
@@ -619,6 +724,10 @@ fn sleep_for(expire_s: u64) -> Duration {
         .unwrap_or(TOKEN_RETRY_BACKOFF)
 }
 
+/// The kind of recipient that is a thread (Lark's topic): what is sent to
+/// it replies to a message in it.
+pub const THREAD: &str = "thread";
+
 // ─────────────────────────── inbound event types ───────────────────────────
 
 /// Decrypted event envelope (event schema 2.0). We only act on
@@ -652,6 +761,34 @@ pub struct MessageReceiveEvent {
 #[derive(Debug, Deserialize)]
 pub struct Sender {
     pub sender_id: SenderId,
+}
+
+/// Someone a message mentions: `key` is what stands for them in its text
+/// (`@_user_1`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Mention {
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub id: MentionId,
+    #[serde(default)]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MentionId {
+    #[serde(default)]
+    pub open_id: Option<String>,
+}
+
+/// `im.chat.member.bot.added_v1`, `im.chat.member.bot.deleted_v1` and
+/// `im.chat.disbanded_v1`: the group the bot was added to or removed from,
+/// or that was disbanded.
+#[derive(Debug, Deserialize)]
+pub struct ChatEvent {
+    pub chat_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// The sender's ids (havn issue #262): `open_id` is the person in this
@@ -724,6 +861,17 @@ pub struct LarkMessage {
     pub content: String,
     #[serde(default)]
     pub create_time: Option<String>,
+    /// The message it replies to.
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    /// The first message of the thread it is in.
+    #[serde(default)]
+    pub root_id: Option<String>,
+    /// The thread (topic) it is in.
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    #[serde(default)]
+    pub mentions: Vec<Mention>,
 }
 
 #[cfg(test)]
