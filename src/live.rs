@@ -8,8 +8,13 @@
 //!
 //! Lark takes 5 updates a second of one message: a reply is updated at most
 //! every [`LIVE_EVERY`]. An update Lark asks to slow down for waits for the
-//! next one; the finished reply waits as Lark asks, in its chat's worker
-//! only, and what cannot be put in its cards goes in new ones.
+//! next one, and one it refuses otherwise waits for the text to change; the
+//! finished reply waits as Lark asks, in its chat's worker only, and what
+//! cannot be put in its cards goes in new ones.
+//!
+//! A card is not taken down (a bot's recall of a message can show in the
+//! chat that it recalled one): one no longer needed is updated to show
+//! nothing ([`retire`]), and only taken down when that fails.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -18,7 +23,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::card;
-use crate::lark::{LarkClient, Refused};
+use crate::lark::{LarkClient, Refused, SlowDown};
 use crate::types::{self, ChannelMessageContent, ChannelOutbound};
 
 /// How often a reply being written is updated, at most: Lark takes 5
@@ -211,27 +216,27 @@ impl Written {
             Vec::new()
         };
         let parts = card::split(text);
-        if let Err(n) = self.put_all(lark, &parts, &buttons, done).await
+        if let Err((n, _)) = self.put_all(lark, &parts, &buttons, done).await
             && done
         {
             self.fall_back(lark, &parts, &buttons, n).await;
         }
     }
 
-    /// [`Self::show`] without its fallback: the first part that could not be
-    /// put, as the error.
+    /// [`Self::show`] without its fallback: the first part that could not
+    /// be put, and whether Lark only asked to slow down, as the error.
     async fn put_all(
         &mut self,
         lark: &LarkClient,
         parts: &[String],
         buttons: &[Vec<types::Button>],
         done: bool,
-    ) -> Result<(), usize> {
+    ) -> Result<(), (usize, bool)> {
         let under = !buttons.is_empty();
         for change in changes(&self.cards, parts, under) {
             let n = match change {
                 Change::Delete(n) => {
-                    take_down(lark, &self.cards[n].id).await;
+                    retire(lark, &self.cards[n].id).await;
                     self.cards.truncate(n);
                     continue;
                 }
@@ -257,7 +262,7 @@ impl Written {
                 }
                 Err(e) => {
                     debug!(error = %format!("{e:#}"), "lark: a reply being written could not be put");
-                    return Err(n);
+                    return Err((n, e.downcast_ref::<SlowDown>().is_some()));
                 }
             }
         }
@@ -322,7 +327,7 @@ impl Written {
         }
         let gone: Vec<Shown> = self.cards.drain(n..).collect();
         for old in gone.iter().rev() {
-            take_down(lark, &old.id).await;
+            retire(lark, &old.id).await;
         }
         self.cards.extend(sent);
     }
@@ -387,7 +392,16 @@ impl Written {
     }
 }
 
-async fn take_down(lark: &LarkClient, id: &str) {
+/// What a card no longer needed shows: nothing, a zero-width space.
+const RETIRED: &str = "\u{200b}";
+
+/// Card `id`, no longer needed, made to show nothing; taken down only when
+/// that fails, as a recall may show in the chat.
+pub async fn retire(lark: &LarkClient, id: &str) {
+    let blank = card::bare(RETIRED).to_string();
+    if lark.update_card(id, &blank, true).await.is_ok() {
+        return;
+    }
     if let Err(e) = lark.delete_message(id).await {
         debug!(error = %format!("{e:#}"), "lark: a card of a reply could not be taken down");
     }
@@ -498,8 +512,10 @@ impl Replies {
                 .written
                 .put_all(lark, &card::split(&text), &shown, false)
                 .await;
-            // Not shown: shown at the next time, after Lark's wait.
-            if put.is_err() && live.written.cards == before {
+            // Not shown as Lark asked to slow down: shown at the next time.
+            // Refused otherwise: tried again once the text changes, or at
+            // its end.
+            if matches!(put, Err((_, true))) && live.written.cards == before {
                 live.latest = Some((text, live.written.buttons.clone(), waiting));
             }
             live.next = tokio::time::Instant::now() + LIVE_EVERY;
@@ -561,28 +577,55 @@ impl Replies {
     }
 
     /// Show `o`, a part of a reply being written or its end, in that
-    /// reply's cards: whether it was; one that is not, or whose reply is not
-    /// shown, goes as any other. The end takes the buttons off; one with
-    /// nothing to show takes its cards down.
-    pub async fn reply(&mut self, lark: &LarkClient, o: &ChannelOutbound) -> bool {
-        let (Some(reply), ChannelMessageContent::Text { text }) = (&o.reply, &o.content) else {
-            return false;
+    /// reply's cards; one that is not, or whose reply is not shown, goes as
+    /// any other. The end takes the buttons off; one with nothing to show
+    /// leaves its cards showing nothing.
+    ///
+    /// One with buttons or a question, or a file, goes as any reply: what
+    /// was shown of its call is finished as it is (its text stays, its
+    /// Stop button goes), and a card that only said the reply was being
+    /// written becomes its first card when it is a card ([`Taken::Into`]),
+    /// else shows nothing. After a part, the next call goes below it.
+    pub async fn reply(&mut self, lark: &LarkClient, o: &ChannelOutbound) -> Taken {
+        let Some(reply) = &o.reply else {
+            return Taken::Deliver;
         };
-        if !o.buttons.is_empty() || o.poll.is_some() {
-            // One with buttons goes as any reply, in place of what was
-            // shown of its call.
-            if let Some(live) = self.live.get_mut(reply)
-                && !std::mem::take(&mut live.part)
-            {
-                live.written.show(lark, "", false, true).await;
+        let text = match &o.content {
+            ChannelMessageContent::Text { text } if o.buttons.is_empty() && o.poll.is_none() => {
+                text
             }
-            if !o.partial {
-                self.end(reply.clone());
+            content => {
+                let Some(live) = self.live.get_mut(reply) else {
+                    return Taken::Deliver;
+                };
+                live.seen = tokio::time::Instant::now();
+                live.latest = None;
+                let mut taken = Taken::Deliver;
+                if std::mem::take(&mut live.part) {
+                    live.written.drop_buttons(lark).await;
+                    live.written = live.written.below();
+                } else if live.written.waiting && live.written.cards.len() == 1 {
+                    let id = live.written.cards[0].id.clone();
+                    if matches!(content, ChannelMessageContent::Text { .. }) {
+                        taken = Taken::Into(id);
+                    } else {
+                        retire(lark, &id).await;
+                    }
+                    live.written.cards.clear();
+                } else {
+                    live.written.drop_buttons(lark).await;
+                }
+                live.written.waiting = false;
+                if o.partial {
+                    live.part = true;
+                } else {
+                    self.end(reply.clone());
+                }
+                return taken;
             }
-            return false;
-        }
+        };
         let Some(live) = self.live.get_mut(reply) else {
-            return false;
+            return Taken::Deliver;
         };
         live.seen = tokio::time::Instant::now();
         live.latest = None;
@@ -597,8 +640,20 @@ impl Replies {
         } else {
             self.end(reply.clone());
         }
-        true
+        Taken::Shown
     }
+}
+
+/// What became of an outbound a reply being written may take.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Taken {
+    /// Shown in its reply's cards.
+    Shown,
+    /// To be delivered as any reply.
+    Deliver,
+    /// To be delivered, its first card in the place of this one, which
+    /// only said the reply was being written.
+    Into(String),
 }
 
 #[cfg(test)]
@@ -670,6 +725,129 @@ mod tests {
         assert!(is_stop("/stop") && is_stop(" /STOP ") && !is_stop("stop") && !is_stop("/stopper"));
     }
 
+    fn lark() -> std::sync::Arc<LarkClient> {
+        // Lark is not there: every call fails at once.
+        LarkClient::unauthenticated("http://127.0.0.1:9".into(), "a".into(), "s".into()).unwrap()
+    }
+
+    fn live_of(cards: Vec<Shown>, waiting: bool) -> Live {
+        let now = tokio::time::Instant::now();
+        let mut written = Written::new("rid", "lark:on_a", ("union_id", "on_a".into()), None);
+        written.cards = cards;
+        written.waiting = waiting;
+        Live {
+            written,
+            latest: Some(("stale".into(), Vec::new(), false)),
+            next: now,
+            part: false,
+            seen: now,
+        }
+    }
+
+    fn end_of(content: ChannelMessageContent, partial: bool) -> ChannelOutbound {
+        ChannelOutbound {
+            seq: 1,
+            account_id: "bot".into(),
+            to: "lark:on_a".into(),
+            in_reply_to: None,
+            content,
+            buttons: Vec::new(),
+            poll: None,
+            partial,
+            reply: Some("rid".into()),
+        }
+    }
+
+    fn file() -> ChannelMessageContent {
+        ChannelMessageContent::File {
+            url: "/api/v1/channel/files/a/b".into(),
+            filename: "a.pdf".into(),
+            caption: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reply_ending_on_a_file_is_ended_and_a_part_that_is_one_goes_below() {
+        let lark = lark();
+        let mut replies = Replies::default();
+        replies
+            .live
+            .insert("rid".into(), live_of(vec![shown("so far", false)], false));
+        replies.order.push_back("rid".into());
+        // A file as a part: delivered as any reply; the next call goes below it.
+        assert_eq!(
+            replies.reply(&lark, &end_of(file(), true)).await,
+            Taken::Deliver
+        );
+        assert!(replies.live["rid"].part && replies.live["rid"].latest.is_none());
+        // A file as its end: delivered, and the reply ends.
+        assert_eq!(
+            replies.reply(&lark, &end_of(file(), false)).await,
+            Taken::Deliver
+        );
+        assert!(!replies.any() && replies.ended.contains(&"rid".to_string()));
+    }
+
+    #[tokio::test]
+    async fn buttons_after_a_part_leave_no_stop_button_nor_old_text() {
+        let lark = lark();
+        let mut replies = Replies::default();
+        let mut live = live_of(vec![shown("the part", false)], false);
+        live.part = true;
+        replies.live.insert("rid".into(), live);
+        let mut asked = end_of(
+            ChannelMessageContent::Text {
+                text: "Which?".into(),
+            },
+            true,
+        );
+        asked.buttons = vec![vec![types::Button {
+            label: "Red".into(),
+            data: "/choose 1".into(),
+        }]];
+        assert_eq!(replies.reply(&lark, &asked).await, Taken::Deliver);
+        let live = &replies.live["rid"];
+        assert!(
+            live.latest.is_none(),
+            "the call's old text is not sent below the buttons"
+        );
+        assert!(live.written.cards.is_empty(), "what comes next goes below");
+        assert!(live.part);
+    }
+
+    #[tokio::test]
+    async fn a_question_goes_in_the_card_that_said_the_reply_was_being_written() {
+        let lark = lark();
+        let mut replies = Replies::default();
+        replies
+            .live
+            .insert("rid".into(), live_of(vec![shown("Replying", true)], true));
+        let mut asked = end_of(
+            ChannelMessageContent::Text {
+                text: "Which?".into(),
+            },
+            false,
+        );
+        asked.buttons = vec![vec![types::Button {
+            label: "Red".into(),
+            data: "/choose 1".into(),
+        }]];
+        assert_eq!(
+            replies.reply(&lark, &asked).await,
+            Taken::Into("om_Replying".into())
+        );
+        assert!(!replies.any());
+        // A file cannot go in a card: that one is made to show nothing.
+        replies.ended.clear();
+        replies
+            .live
+            .insert("rid".into(), live_of(vec![shown("Replying", true)], true));
+        assert_eq!(
+            replies.reply(&lark, &end_of(file(), false)).await,
+            Taken::Deliver
+        );
+    }
+
     #[tokio::test]
     async fn a_reply_being_written_is_kept_by_any_frame_and_finished_when_idle() {
         // Lark is not there: every card fails, which leaves the reply waiting.
@@ -690,9 +868,10 @@ mod tests {
         assert!(replies.any() && replies.due().is_some());
         replies.update_due(&lark).await;
         assert!(
-            replies.live["rid"].latest.is_some(),
-            "not shown: kept for the next time"
+            replies.live["rid"].latest.is_none(),
+            "refused, not for slowing down: not tried again until the text changes"
         );
+        replies.writing(&lark, w("Hel", false)).await;
         // A frame that only says it is alive keeps the text to show.
         replies.writing(&lark, w("", true)).await;
         assert_eq!(

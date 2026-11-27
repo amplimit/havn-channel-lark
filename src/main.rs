@@ -487,10 +487,16 @@ async fn chat_worker(
                     .catch_unwind()
                     .await;
                 // A part of a reply being written, or its end, takes the
-                // place of what was shown; any other goes as it is, as does
-                // one whose showing failed.
-                if !matches!(shown, Ok(true)) {
-                    let sent = std::panic::AssertUnwindSafe(deliver_outbound(&out, &o))
+                // place of what was shown; any other goes as it is (into the
+                // card that said the reply was being written, when there is
+                // one), as does one whose showing failed.
+                let into = match shown {
+                    Ok(live::Taken::Shown) => None,
+                    Ok(live::Taken::Into(id)) => Some(Some(id)),
+                    Ok(live::Taken::Deliver) | Err(_) => Some(None),
+                };
+                if let Some(into) = into {
+                    let sent = std::panic::AssertUnwindSafe(deliver_outbound(&out, &o, into))
                         .catch_unwind()
                         .await;
                     match sent {
@@ -630,6 +636,9 @@ struct Target<'a> {
     to: Option<(&'static str, &'a str)>,
     /// The recipient as the gateway names it, which presses must come from.
     named: &'a str,
+    /// A card of the bot's the first card goes in, updated in its place: one
+    /// that only said a reply was being written.
+    into: Option<String>,
 }
 
 impl<'a> Target<'a> {
@@ -638,11 +647,34 @@ impl<'a> Target<'a> {
             reply_to: o.in_reply_to.as_deref().filter(|id| id.starts_with("om_")),
             to: recipient(&o.to),
             named: &o.to,
+            into: None,
         }
     }
 
-    /// Send one message, of `msg_type` and its `content` JSON.
+    /// Send one message, of `msg_type` and its `content` JSON: the first
+    /// card in the place of [`Self::into`] when there is one. A message that
+    /// is not a card cannot go there: that card is made to show nothing.
     async fn send(&mut self, lark: &LarkClient, msg_type: &str, content: &Value) -> Result<Sent> {
+        if let Some(id) = self.into.take() {
+            if msg_type == "interactive" {
+                match lark.update_card(&id, &content.to_string(), true).await {
+                    Ok(()) => {
+                        return Ok(Sent {
+                            message_id: id,
+                            chat_id: String::new(),
+                        });
+                    }
+                    Err(e) if refused(&e) => {
+                        live::retire(lark, &id).await;
+                        return Err(e);
+                    }
+                    Err(e) => {
+                        warn!(error = %format!("{e:#}"), "lark: a reply could not go in the card that said it was being written; sending it anew");
+                    }
+                }
+            }
+            live::retire(lark, &id).await;
+        }
         let content = content.to_string();
         let sent = match (self.reply_to, self.to) {
             (Some(message_id), _) => lark.reply_message(message_id, msg_type, &content).await?,
@@ -671,8 +703,9 @@ fn refused(e: &anyhow::Error) -> bool {
 /// last), a question of several answers as a card with a menu, and a file
 /// fetched from the gateway and sent as an image or a file, its caption in
 /// a card after it. Audio, locations and contacts go as text markers.
-async fn deliver_outbound(out: &Out, o: &ChannelOutbound) -> Result<()> {
+async fn deliver_outbound(out: &Out, o: &ChannelOutbound, into: Option<String>) -> Result<()> {
     let mut target = Target::of(o);
+    target.into = into;
     let text = match &o.content {
         ChannelMessageContent::Text { text } => text.clone(),
         ChannelMessageContent::Image { url, caption } => {
