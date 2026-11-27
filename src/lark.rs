@@ -111,6 +111,20 @@ impl LarkClient {
         }))
     }
 
+    /// The URL of the API path of `segments`, each percent-encoded, so an id
+    /// Lark gave cannot reach another path.
+    fn url_of(&self, segments: &[&str]) -> String {
+        match url::Url::parse(&self.base_url) {
+            Ok(mut url) => {
+                if let Ok(mut path) = url.path_segments_mut() {
+                    path.pop_if_empty().extend(segments);
+                }
+                url.to_string()
+            }
+            Err(_) => self.url(&format!("/{}", segments.join("/"))),
+        }
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)
     }
@@ -185,7 +199,7 @@ impl LarkClient {
         let body = json!({ "msg_type": msg_type, "content": content });
         let req = self
             .http
-            .post(self.url(&format!("/open-apis/im/v1/messages/{message_id}/reply")))
+            .post(self.url_of(&["open-apis", "im", "v1", "messages", message_id, "reply"]))
             .json(&body);
         self.send_message_req(req).await
     }
@@ -293,7 +307,7 @@ impl LarkClient {
         }
         let parsed: Resp = self
             .http
-            .post(self.url(&format!("/open-apis/im/v1/messages/{message_id}/reactions")))
+            .post(self.url_of(&["open-apis", "im", "v1", "messages", message_id, "reactions"]))
             .header("Authorization", self.bearer().await)
             .json(&json!({ "reaction_type": { "emoji_type": emoji_type } }))
             .send()
@@ -325,9 +339,15 @@ impl LarkClient {
         }
         let parsed: Resp = self
             .http
-            .delete(self.url(&format!(
-                "/open-apis/im/v1/messages/{message_id}/reactions/{reaction_id}"
-            )))
+            .delete(self.url_of(&[
+                "open-apis",
+                "im",
+                "v1",
+                "messages",
+                message_id,
+                "reactions",
+                reaction_id,
+            ]))
             .header("Authorization", self.bearer().await)
             .send()
             .await
@@ -356,9 +376,15 @@ impl LarkClient {
     ) -> Result<Vec<u8>> {
         let mut resp = self
             .http
-            .get(self.url(&format!(
-                "/open-apis/im/v1/messages/{message_id}/resources/{file_key}"
-            )))
+            .get(self.url_of(&[
+                "open-apis",
+                "im",
+                "v1",
+                "messages",
+                message_id,
+                "resources",
+                file_key,
+            ]))
             .query(&[("type", kind)])
             .header("Authorization", self.bearer().await)
             .send()
@@ -636,6 +662,25 @@ pub struct LarkMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ids_in_a_path_are_percent_encoded() {
+        let lark =
+            LarkClient::unauthenticated("https://open.feishu.cn/".into(), "a".into(), "s".into())
+                .unwrap();
+        assert_eq!(
+            lark.url_of(&[
+                "open-apis",
+                "im",
+                "v1",
+                "messages",
+                "om_1/../x?y#z",
+                "resources",
+                "f k"
+            ]),
+            "https://open.feishu.cn/open-apis/im/v1/messages/om_1%2F..%2Fx%3Fy%23z/resources/f%20k"
+        );
+    }
 
     #[test]
     fn a_message_lark_asks_to_slow_down_for_is_sent_again_after_the_wait() {

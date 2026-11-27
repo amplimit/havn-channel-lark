@@ -136,6 +136,7 @@ async fn main() -> Result<()> {
         delivered: Arc::clone(&delivered),
         working: out.working.clone(),
         cards: Arc::clone(&out.cards),
+        people: Arc::default(),
         outbound_tx: outbound_tx.clone(),
         account_id: cfg.account_id.clone(),
         seq: Arc::new(AtomicU64::new(1)),
@@ -404,7 +405,7 @@ async fn chat_worker(
         // A reply came, or the end of one: a message waits on one fewer. A
         // part of one has more to come.
         if !o.partial {
-            out.working.replied(&o.to);
+            out.working.replied(&o.to, o.in_reply_to.as_deref());
         }
         last = tokio::time::Instant::now();
     }

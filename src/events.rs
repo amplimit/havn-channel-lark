@@ -78,14 +78,49 @@ pub enum Arrival {
     /// A message a sender sent.
     Message(Box<MessageReceiveEvent>, Value),
     /// What a press or the bot's menu sends, as if the person typed it;
-    /// `react` shows that its reply is due on the message pressed.
+    /// `react_on`, the card pressed, shows that its reply is due.
     Said {
         ids: SenderId,
         message_id: String,
         text: String,
         raw: Value,
-        react: bool,
+        react_on: Option<String>,
     },
+}
+
+/// The start of the message id of a press, which is no message to reply
+/// to: its reply goes to the person, in their private chat.
+pub const PRESS_PREFIX: &str = "press:";
+
+/// People whose private chats with the bot are known, at most; past that,
+/// the oldest are let go.
+const PEOPLE_KEPT: usize = 4096;
+
+/// Each person's private chat with the bot, by their ids, as their messages
+/// showed it.
+#[derive(Debug, Default)]
+pub struct People {
+    chats: HashMap<String, String>,
+    order: VecDeque<String>,
+}
+
+impl People {
+    fn note(&mut self, ids: &[String], chat: &str) {
+        for id in ids {
+            if self.chats.insert(id.clone(), chat.to_string()).is_none() {
+                self.order.push_back(id.clone());
+            }
+        }
+        while self.order.len() > PEOPLE_KEPT {
+            if let Some(oldest) = self.order.pop_front() {
+                self.chats.remove(&oldest);
+            }
+        }
+    }
+
+    fn chat_of(&self, ids: &[String]) -> Option<String> {
+        ids.iter().find_map(|id| self.chats.get(id).cloned())
+    }
 }
 
 /// The start of the message id of an item of the bot's menu chosen, which
@@ -100,6 +135,7 @@ pub struct Incoming {
     pub delivered: Arc<Delivered>,
     pub working: Working,
     pub cards: Arc<Mutex<card::Cards>>,
+    pub people: Arc<Mutex<People>>,
     pub outbound_tx: mpsc::Sender<ChannelFrame>,
     pub account_id: String,
     pub seq: Arc<AtomicU64>,
@@ -244,15 +280,29 @@ impl Incoming {
         // Translate + forward off the answer's path (Lark wants it within
         // 3s; STT/download can take longer), in the chat's order.
         let chat = ev.message.chat_id.clone();
-        self.to_chat(
+        if ev.message.chat_type == "p2p" {
+            let (sender, aliases) = sender_ids(&ev.sender.sender_id);
+            let mut ids = aliases;
+            ids.push(sender);
+            self.people().note(&ids, &chat);
+        }
+        let _ = self.to_chat(
             chat,
             Arrival::Message(Box::new(ev), without_secrets(payload)),
         );
         Taken::Done
     }
 
-    /// Hand `arrival` to the worker of `chat`, started when it has none.
-    fn to_chat(&self, chat: String, arrival: Arrival) {
+    fn people(&self) -> std::sync::MutexGuard<'_, People> {
+        self.people
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Hand `arrival` to the worker of `chat`, started when it has none:
+    /// whether it was, which it is not when the chat has as many waiting as
+    /// it may.
+    fn to_chat(&self, chat: String, arrival: Arrival) -> bool {
         let mut chats = self
             .chats
             .lock()
@@ -264,7 +314,9 @@ impl Incoming {
         });
         if tx.try_send(arrival).is_err() {
             warn!(chat = %chat, "lark: a chat has as many messages waiting as it may; dropping one");
+            return false;
         }
+        true
     }
 }
 
@@ -541,36 +593,50 @@ impl Incoming {
             }
         };
         let message_id = ev.context.open_message_id.clone();
-        let shown = {
-            let mut cards = self
-                .cards
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            cards.press(&message_id)
-        };
-        let card::Pressed::Now(shown) = shown else {
+        let mut ids_of_sender = aliases;
+        ids_of_sender.push(sender.clone());
+        let private = self.people().chat_of(&ids_of_sender);
+        // With the cards' lock held, so a card is marked pressed only once,
+        // and only once its press is on its way.
+        let mut cards = self
+            .cards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cards.was_pressed(&message_id) {
             return toast("info", "This was answered already.");
-        };
-        let chat = if ev.context.open_chat_id.is_empty() {
-            sender.clone()
-        } else {
-            ev.context.open_chat_id.clone()
-        };
-        self.to_chat(
+        }
+        // One of the bot's cards it knows, or one in the person's private
+        // chat with it: a copy forwarded into a group, pressed there, is
+        // not taken, so the agent's private reply goes to no group.
+        let ours = cards.knows(&message_id);
+        let in_private =
+            private.is_some() && private.as_deref() == Some(ev.context.open_chat_id.as_str());
+        if !ours && !in_private {
+            warn!(message = %message_id, "lark: a card pressed outside the person's private chat with the bot");
+            return toast("error", "Press it in your chat with the bot.");
+        }
+        // The person's private chat, where their messages wait in turn.
+        let chat = private.unwrap_or_else(|| sender.clone());
+        let queued = self.to_chat(
             chat,
             Arrival::Said {
                 ids,
-                message_id,
+                message_id: format!("{PRESS_PREFIX}{message_id}"),
                 text: said,
                 raw,
-                react: true,
+                react_on: Some(message_id.clone()),
             },
         );
+        if !queued {
+            return toast("warning", "Busy; try again in a moment.");
+        }
         // The card without its buttons, so it is pressed once; one sent
         // before a restart keeps them.
-        match shown {
-            Some(markdown) => json!({ "card": { "type": "raw", "data": card::bare(&markdown) } }),
-            None => json!({}),
+        match cards.press(&message_id) {
+            card::Pressed::Now(Some(markdown)) => {
+                json!({ "card": { "type": "raw", "data": card::bare(&markdown) } })
+            }
+            _ => json!({}),
         }
     }
 
@@ -594,15 +660,21 @@ impl Incoming {
         } else {
             format!("/{key}")
         };
-        let (sender, _) = self.ids(&ev.operator.operator_id);
-        self.to_chat(
-            sender,
+        let (sender, aliases) = sender_ids(&ev.operator.operator_id);
+        let mut ids = aliases;
+        ids.push(sender.clone());
+        // In turn with the person's messages, in their private chat; Lark
+        // names no chat for a menu item, so when none of their messages
+        // showed it yet, the menu's items wait in a line of their own.
+        let chat = self.people().chat_of(&ids).unwrap_or(sender);
+        let _ = self.to_chat(
+            chat,
             Arrival::Said {
                 ids: ev.operator.operator_id,
                 message_id: format!("{MENU_PREFIX}{event_id}"),
                 text,
                 raw,
-                react: false,
+                react_on: None,
             },
         );
     }
@@ -637,7 +709,9 @@ async fn translate_and_forward(incoming: Incoming, arrival: Arrival) {
             else {
                 return;
             };
-            incoming.working.start(&sender, &m.message_id);
+            incoming
+                .working
+                .start(&sender, &m.message_id, &m.message_id);
             let timestamp = m
                 .create_time
                 .as_deref()
@@ -658,11 +732,11 @@ async fn translate_and_forward(incoming: Incoming, arrival: Arrival) {
             message_id,
             text,
             raw,
-            react,
+            react_on,
         } => {
-            if react {
+            if let Some(react_on) = react_on {
                 let (sender, _) = incoming.ids(&ids);
-                incoming.working.start(&sender, &message_id);
+                incoming.working.start(&sender, &react_on, &message_id);
             }
             (
                 ids,
@@ -908,7 +982,10 @@ pub struct Working {
 /// A message with the reaction on, or being put on.
 struct Shown {
     id: u64,
+    /// The message the reaction is on.
     message_id: String,
+    /// The message id its reply names in `in_reply_to`.
+    answered_by: String,
     reaction: Option<String>,
 }
 
@@ -931,8 +1008,8 @@ impl Working {
     }
 
     /// Message `message_id` came from `to` (the id replies go to): its reply
-    /// is due.
-    pub fn start(&self, to: &str, message_id: &str) {
+    /// is due, named `answered_by` as its reply answers it.
+    pub fn start(&self, to: &str, message_id: &str, answered_by: &str) {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         self.chats()
             .entry(to.to_string())
@@ -940,6 +1017,7 @@ impl Working {
             .push_back(Shown {
                 id,
                 message_id: message_id.to_string(),
+                answered_by: answered_by.to_string(),
                 reaction: None,
             });
         let this = self.clone();
@@ -974,10 +1052,16 @@ impl Working {
         });
     }
 
-    /// A reply went to `to`, or one that ends a turn: the oldest message
-    /// waiting there loses its reaction.
-    pub fn replied(&self, to: &str) {
-        self.end(to, |_| true);
+    /// A reply went to `to`, or one that ends a turn. The message it
+    /// answers (`in_reply_to`) loses its reaction, and one that answers a
+    /// message without one takes no other's. A reply that names none, as the
+    /// agent's in a private chat, takes it off the oldest there: the gateway
+    /// does not say which it answers, nor tell them from a scheduled report.
+    pub fn replied(&self, to: &str, in_reply_to: Option<&str>) {
+        match in_reply_to {
+            Some(answers) => self.end(to, |s| s.answered_by == answers),
+            None => self.end(to, |_| true),
+        }
     }
 
     fn end(&self, to: &str, which: impl Fn(&Shown) -> bool) {
@@ -1214,6 +1298,7 @@ mod tests {
                 delivered,
                 working: Working::new(lark),
                 cards: Arc::default(),
+                people: Arc::default(),
                 outbound_tx: tx,
                 account_id: "bot".into(),
                 seq: Arc::new(AtomicU64::new(1)),
@@ -1334,7 +1419,8 @@ mod tests {
         let inb = said(&mut rx).await;
         assert_eq!(inb.sender_id, "lark:on_ou_a");
         assert_eq!(inb.sender_aliases, ["lark:ou_a"]);
-        assert_eq!(inb.channel_message_id, "om_card");
+        // Its reply goes to the person, not as a reply to the card.
+        assert_eq!(inb.channel_message_id, "press:om_card");
         let raw = inb.raw.as_ref().unwrap();
         assert!(
             raw["event"].get("token").is_none()
@@ -1357,6 +1443,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_card_pressed_outside_the_person_s_private_chat_is_not_taken() {
+        let (incoming, mut rx) = incoming(None, None);
+        // A message shows their private chat, oc_1.
+        assert_eq!(incoming.take(message_event("m1", "om_m1", "")), Taken::Done);
+        let _ = said(&mut rx).await;
+        let value = json!({ "said": "/approve 7", "to": "lark:on_b" });
+        // A copy of the card, which the daemon does not know, forwarded into
+        // a group and pressed there.
+        let mut forwarded = press_event("p1", "ou_a", value, json!({}));
+        forwarded["event"]["operator"]["union_id"] = json!("on_b");
+        forwarded["event"]["context"]["open_message_id"] = json!("om_copy");
+        forwarded["event"]["context"]["open_chat_id"] = json!("oc_group");
+        let Taken::Answer(answer) = incoming.take(forwarded) else {
+            panic!("answered");
+        };
+        assert_eq!(answer["toast"]["type"], "error");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err(), "nothing goes on");
+        assert!(!incoming.cards.lock().unwrap().was_pressed("om_copy"));
+    }
+
+    #[tokio::test]
     async fn a_question_sends_back_its_answer_and_the_numbers_chosen() {
         let (incoming, mut rx) = incoming(None, None);
         let value = json!({ "kind": "question", "answer": "/answer q1", "to": "lark:on_ou_a" });
@@ -1372,15 +1480,36 @@ mod tests {
         let Taken::Answer(answer) = incoming.take(press_event(
             "q1",
             "ou_a",
-            value,
+            value.clone(),
             json!({ "choices": ["1", "3"] }),
         )) else {
             panic!("answered");
         };
         assert_eq!(
+            answer["toast"]["type"], "error",
+            "a card it does not know, pressed where it does not know the person's chat"
+        );
+        // A message of theirs shows their private chat with the bot, oc_1:
+        // a card it does not know (sent before a restart) is taken there.
+        assert_eq!(incoming.take(message_event("m1", "om_m1", "")), Taken::Done);
+        let _ = said(&mut rx).await;
+        let mut theirs = press_event(
+            "q2",
+            "ou_a",
+            value.clone(),
+            json!({ "choices": ["1", "3"] }),
+        );
+        theirs["event"]["operator"]["union_id"] = json!("on_b");
+        theirs["event"]["operator"]["open_id"] = json!("ou_a");
+        let value = json!({ "kind": "question", "answer": "/answer q1", "to": "lark:on_b" });
+        theirs["event"]["action"]["value"] = value.clone();
+        let Taken::Answer(answer) = incoming.take(theirs) else {
+            panic!("answered");
+        };
+        assert_eq!(
             answer,
             json!({}),
-            "a card the daemon does not know is left as it is"
+            "a card it does not know is left as it is"
         );
         let inb = said(&mut rx).await;
         assert_eq!(
@@ -1418,14 +1547,22 @@ mod tests {
     async fn a_reply_takes_the_reaction_off_its_chat_s_oldest_message() {
         let (incoming, _rx) = incoming(None, None);
         let working = &incoming.working;
-        working.start("lark:on_a", "om_1");
-        working.start("lark:on_a", "om_2");
-        working.start("lark:on_b", "om_3");
+        working.start("lark:on_a", "om_1", "om_1");
+        working.start("lark:on_a", "om_2", "om_2");
+        working.start("lark:on_a", "om_card", "press:om_card");
+        working.start("lark:on_b", "om_3", "om_3");
+        assert_eq!(working.waiting("lark:on_a"), ["om_1", "om_2", "om_card"]);
+        // The reply to a press takes the card's off, and only that.
+        working.replied("lark:on_a", Some("press:om_card"));
         assert_eq!(working.waiting("lark:on_a"), ["om_1", "om_2"]);
-        working.replied("lark:on_a");
-        assert_eq!(working.waiting("lark:on_a"), ["om_2"]);
-        working.replied("lark:on_a");
-        working.replied("lark:on_a");
+        // A reply to a message with none, as an item of the menu, takes none.
+        working.replied("lark:on_a", Some("menu:ev_1"));
+        assert_eq!(working.waiting("lark:on_a"), ["om_1", "om_2"]);
+        working.replied("lark:on_a", Some("om_2"));
+        assert_eq!(working.waiting("lark:on_a"), ["om_1"]);
+        // One that names none: the oldest.
+        working.replied("lark:on_a", None);
+        working.replied("lark:on_a", None);
         assert_eq!(working.waiting("lark:on_a"), Vec::<String>::new());
         assert_eq!(working.waiting("lark:on_b"), ["om_3"]);
     }

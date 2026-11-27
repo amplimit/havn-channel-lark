@@ -324,7 +324,17 @@ impl Cards {
         }
     }
 
-    /// A press on card `message_id`.
+    /// Whether card `message_id` was pressed before.
+    pub fn was_pressed(&self, message_id: &str) -> bool {
+        self.pressed.contains(message_id)
+    }
+
+    /// Whether card `message_id` is one the bot sent and remembers.
+    pub fn knows(&self, message_id: &str) -> bool {
+        self.shown.contains_key(message_id)
+    }
+
+    /// A press on card `message_id`, taken.
     pub fn press(&mut self, message_id: &str) -> Pressed {
         if !self.pressed.insert(message_id.to_string()) {
             return Pressed::Before;
@@ -425,7 +435,9 @@ mod tests {
     fn a_card_is_pressed_once_and_remembered_up_to_a_bound() {
         let mut cards = Cards::default();
         cards.note("om_1", "Approve?");
+        assert!(cards.knows("om_1") && !cards.was_pressed("om_1"));
         assert_eq!(cards.press("om_1"), Pressed::Now(Some("Approve?".into())));
+        assert!(cards.was_pressed("om_1") && !cards.knows("om_1"));
         assert_eq!(cards.press("om_1"), Pressed::Before);
         assert_eq!(cards.press("om_unknown"), Pressed::Now(None));
         for n in 0..=CARDS_KEPT {
