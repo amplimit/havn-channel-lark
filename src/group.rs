@@ -396,7 +396,7 @@ fn save_threads() {
 }
 
 /// Write the threads as they are now to [`THREADS_FILE`].
-fn write_threads() {
+pub fn write_threads() {
     let Some(path) = THREADS_FILE.get() else {
         return;
     };

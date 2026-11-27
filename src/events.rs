@@ -1282,7 +1282,7 @@ const WORKING_FOR: std::time::Duration = std::time::Duration::from_mins(5);
 /// conversation may hear nothing being written: the gateway says it every
 /// minute while a reply is.
 const QUIET_EVERY: std::time::Duration = std::time::Duration::from_secs(45);
-const QUIET_FOR: std::time::Duration = std::time::Duration::from_secs(75);
+const QUIET_FOR: std::time::Duration = std::time::Duration::from_secs(120);
 /// Conversations whose last writing is kept at most.
 const WRITTEN_KEPT: usize = 4096;
 

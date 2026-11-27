@@ -181,6 +181,8 @@ async fn main() -> Result<()> {
         r = outbound_task => warn!(result = ?r, "havn outbound loop exited unexpectedly"),
     }
     drop(outbound_tx);
+    // A thread first seen in the last moment before stopping is kept too.
+    group::write_threads();
     Ok(())
 }
 
